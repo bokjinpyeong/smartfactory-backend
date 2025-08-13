@@ -2,23 +2,21 @@ name: Deploy Backend to EC2
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout (optional)
         uses: actions/checkout@v3
 
-      - name: Setup Node.js v18
+      - name: Setup Node.js (optional)
         uses: actions/setup-node@v3
         with:
-          node-version: '18.x'
-
-      - name: Install dependencies
-        run: npm install
+          node-version: 18
 
       - name: Deploy & Restart on EC2
         uses: appleboy/ssh-action@v1.0.0
@@ -27,7 +25,46 @@ jobs:
           username: ubuntu
           key: ${{ secrets.EC2_KEY }}
           script: |
-            cd /home/ubuntu/app/backend
-            git pull origin main
-            npm install
-            pm2 restart backend || pm2 start npm --name backend -- start
+            set -e
+
+            # 0) 기본 준비
+            sudo mkdir -p /home/ubuntu/app && sudo chown -R ubuntu:ubuntu /home/ubuntu/app
+
+            # 1) 코드 동기화(없으면 clone)
+            if [ -d /home/ubuntu/app/backend/.git ]; then
+              cd /home/ubuntu/app/backend
+              git fetch origin main
+              git reset --hard origin/main
+            else
+              cd /home/ubuntu/app
+              git clone https://github.com/<YOUR_USER_OR_ORG>/<YOUR_BACKEND_REPO>.git backend
+              cd backend
+            fi
+
+            # 2) 의존성 설치
+            npm ci --omit=dev || npm install --production
+
+            # 3) PM2 설치(없으면)
+            command -v pm2 >/dev/null 2>&1 || npm i -g pm2
+
+            # 4) 에코시스템(프로세스 이름 index, 포트 5000)
+            cat > ecosystem.config.js <<'EOF'
+            module.exports = {
+              apps: [{
+                name: "index",
+                script: "npm",
+                args: "start",
+                cwd: "/home/ubuntu/app/backend",
+                env: { PORT: 5000, NODE_ENV: "production" }
+              }]
+            };
+            EOF
+
+            # 5) 중복 프로세스 정리 + 기동
+            pm2 delete backend || true
+            if pm2 describe index >/dev/null 2>&1; then
+              pm2 reload index --update-env
+            else
+              pm2 start ecosystem.config.js --only index
+            fi
+            pm2 save

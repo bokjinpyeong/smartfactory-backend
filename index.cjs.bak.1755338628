@@ -1,0 +1,147 @@
+// 📁 backend/index.cjs
+// 서버 엔트리: 인증(/auth) + 보호 API(/api/*) + SPA 정적 제공 + 람다 호출
+
+const path = require("path");
+const express = require("express");
+const cors = require("cors");
+const compression = require("compression");
+require("dotenv").config();
+
+// === AWS SDK (Lambda / EventBridge) ===
+const { LambdaClient, InvokeCommand } = require("@aws-sdk/client-lambda");
+const { EventBridgeClient, PutEventsCommand } = require("@aws-sdk/client-eventbridge");
+
+const app = express();
+const port = Number(process.env.PORT || 4000);                // Nginx 프록시와 통일(4000)
+const AWS_REGION = process.env.AWS_REGION || "ap-northeast-2";
+const SCHEDULE_FN = process.env.SCHEDULE_FN || "schedule_optimizer";
+const EVENT_BUS   = process.env.EVENT_BUS   || "smartfactory-bus";
+
+const lambda = new LambdaClient({ region: AWS_REGION });
+const eb     = new EventBridgeClient({ region: AWS_REGION });
+
+// ─────────────────────────────────────────────────────
+// 기본 설정
+// ─────────────────────────────────────────────────────
+app.set("trust proxy", true);
+app.use(cors());
+app.use(compression());
+app.use(express.json({ limit: "2mb" }));
+app.use(express.urlencoded({ extended: true }));
+
+if (process.env.NODE_ENV !== "production") {
+  app.use((req, _res, next) => {
+    console.log(`➡ ${req.method} ${req.originalUrl}`);
+    next();
+  });
+}
+
+// ─────────────────────────────────────────────────────
+// 라우터 로드 (기존 유지)
+// ─────────────────────────────────────────────────────
+const authRoutes         = require("./routes/auth.cjs");
+const lineOrderRoutes    = require("./routes/lineOrder.cjs");
+const powerTypeRoutes    = require("./routes/powerType.cjs");
+const powercustomRoutes  = require("./routes/powercustom.cjs"); // /day-all, /day, /range
+const powerDataRoutes    = require("./routes/powerData.cjs");   // /weekly, /monthly
+
+// ─────────────────────────────────────────────────────
+// 라우터 마운트
+// ─────────────────────────────────────────────────────
+app.use("/auth", authRoutes);               // 비보호
+app.use("/api/equipment",    lineOrderRoutes);
+app.use("/api/powertype",    powerTypeRoutes);
+app.use("/api/power-custom", powercustomRoutes);
+app.use("/api/power-data",   powercustomRoutes); // 호환
+app.use("/api/power-data",   powerDataRoutes);
+
+// Alerts 라우터 (옵션)
+if (process.env.ALERTS_ENABLED !== "0") {
+  try {
+    const alertRoutes = require("./routes/alerts.cjs");
+    app.use("/api/alerts", alertRoutes);
+    console.log("[index] alerts router loaded");
+  } catch (e) {
+    console.error("[index] alerts router load failed:", e.message);
+  }
+} else {
+  console.log("[index] alerts disabled by env");
+}
+
+// live / worksimul (옵션)
+try {
+  const liveRoutes = require("./routes/live.cjs");         // 내부 경로: /live/price
+  app.use("/api", liveRoutes);                             // 최종 /api/live/price
+  console.log("[index] live router loaded");
+} catch (e) { console.error("[index] live router load failed:", e.message); }
+
+try {
+  const workSimulRoutes = require("./routes/workSimul.cjs"); // 내부 경로: /worksimul
+  app.use("/api", workSimulRoutes);                           // 최종 /api/worksimul
+  console.log("[index] workSimul router loaded");
+} catch (e) { console.error("[index] workSimul router load failed:", e.message); }
+
+// ─────────────────────────────────────────────────────
+// ✅ 헬스체크 (프록시 점검용)
+// ─────────────────────────────────────────────────────
+app.get("/api/healthz", (_req, res) => res.json({ ok: true }));
+app.get("/healthz",     (_req, res) => res.json({ ok: true })); // 기존 호환
+
+// ─────────────────────────────────────────────────────
+// ✅ 람다 스케줄 최적화 — 동기 호출(프론트 즉시 응답)
+// ─────────────────────────────────────────────────────
+app.post("/api/schedule/optimize", async (req, res) => {
+  try {
+    const payload = { detail: req.body }; // 람다에서 event.detail 로 읽음
+    const out = await lambda.send(new InvokeCommand({
+      FunctionName: SCHEDULE_FN,
+      Payload: Buffer.from(JSON.stringify(payload)),
+    }));
+    const raw = out.Payload ? Buffer.from(out.Payload).toString() : "{}";
+    let parsed; try { parsed = JSON.parse(raw); } catch { parsed = { raw }; }
+    const body = parsed && parsed.body ? JSON.parse(parsed.body) : parsed;
+    return res.json(body);
+  } catch (err) {
+    console.error("[/api/schedule/optimize] invoke error:", err);
+    return res.status(500).json({ ok: false, error: "schedule_optimizer invoke failed" });
+  }
+});
+
+// (옵션) 비동기 — EventBridge로 던지고 202 반환
+app.post("/api/schedule/optimize/async", async (req, res) => {
+  try {
+    const entry = {
+      EventBusName: EVENT_BUS,
+      Source: "smartfactory.ui",
+      DetailType: "optimizeScheduleRequested",
+      Detail: JSON.stringify(req.body),
+    };
+    await eb.send(new PutEventsCommand({ Entries: [entry] }));
+    return res.status(202).json({ ok: true });
+  } catch (err) {
+    console.error("[/api/schedule/optimize/async] putEvents error:", err);
+    return res.status(500).json({ ok: false, error: "putEvents failed" });
+  }
+});
+
+// (옵션) /api 알 수 없는 경로는 JSON 404
+app.use("/api", (_req, res) => res.status(404).json({ ok: false, message: "Not Found" }));
+
+// ─────────────────────────────────────────────────────
+// 정적 파일 제공(리액트 빌드 결과) — Nginx가 제공하면 주석 처리 가능
+// ─────────────────────────────────────────────────────
+const distDir = path.join(__dirname, "../femspj/dist");
+app.use(express.static(distDir));
+app.get("*", (req, res, next) => {
+  if (req.path.startsWith("/api/") || req.path.startsWith("/auth/") || req.path === "/healthz") return next();
+  res.sendFile(path.join(distDir, "index.html"));
+});
+
+// 에러 핸들러
+app.use((err, _req, res, _next) => {
+  console.error("🔥 Unhandled error:", err);
+  res.status(500).json({ ok: false, message: "Internal Server Error" });
+});
+
+// 서버 시작
+app.listen(port, () => console.log(`🚀 server listening on http://localhost:${port}`));

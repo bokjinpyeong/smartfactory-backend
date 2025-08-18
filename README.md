@@ -1,50 +1,48 @@
-Smart Factory Energy Optimization — Backend (Express)
+## 1) English
 
-Language order: English first, then Korean below.
-
-1) English
-Overview
-
-Node.js + Express backend for the IoT-based Smart Factory project.
+### Overview
+Node.js + Express backend for the IoT-based Smart Factory project.  
 It exposes REST APIs for authentication, power data queries/aggregation, live price, alerts, and job schedule optimization (via AWS Lambda or local Python).
 
-Entrypoint & Port
+### Entrypoint & Port
+- Entrypoint: `backend/index.cjs`  
+- Port: `4000`  
+- Health: `GET /healthz`, `GET /api/healthz` → `{ ok: true }`
 
-Entrypoint: backend/index.cjs
-
-Port: 4000
-
-Health: GET /healthz, GET /api/healthz → { ok: true }
-
-Folder Structure (actual)
+### Folder Structure (actual)
 backend/
-├─ index.cjs                # main server
-├─ server.js                # legacy lambda-invoke example (not for prod)
+├─ index.cjs # main server
+├─ server.js # legacy lambda-invoke example (not for prod)
 ├─ routes/
-│  ├─ auth.cjs              # /auth/*
-│  ├─ lineOrder.cjs         # /api/equipment/*
-│  ├─ powerType.cjs         # /api/powertype/*
-│  ├─ powercustom.cjs       # /api/power-custom/*
-│  ├─ powerData.cjs         # /api/power-data/*
-│  ├─ live.cjs              # /api/live/*
-│  ├─ alerts.cjs            # /api/alerts/*
-│  └─ workSimul.cjs         # /api/worksimul*
-├─ db/connection.cjs        # MySQL connection (mysql2)
+│ ├─ auth.cjs # /auth/*
+│ ├─ lineOrder.cjs # /api/equipment/*
+│ ├─ powerType.cjs # /api/powertype/*
+│ ├─ powercustom.cjs # /api/power-custom/*
+│ ├─ powerData.cjs # /api/power-data/*
+│ ├─ live.cjs # /api/live/*
+│ ├─ alerts.cjs # /api/alerts/*
+│ └─ workSimul.cjs # /api/worksimul*
+├─ db/connection.cjs # MySQL connection (mysql2)
 ├─ middleware/requireAuth.cjs
-├─ python/optimizer.py      # optional local fallback
-├─ .env                     # environment
-└─ package.json             # dependencies (no scripts required)
+├─ python/optimizer.py # optional local fallback
+├─ .env # environment
+└─ package.json # dependencies (no scripts required)
 
-One-shot Setup & Run (copy/paste)
+sql
+복사
+편집
+
+### One-shot Setup & Run (non-clickable)
+```bash
 # 0) move into backend
 cd backend
 
 # 1) write .env (no editing needed)
-cat > .env <<'EOF'
+cat > .env <<'EOT'
 # Server
 PORT=4000
 NODE_ENV=production
-CORS_ORIGIN=https://api.sensor-tive.com
+CORS_ORIGIN=`https://api.sensor-tive.com`
 
 # DB (local Docker MySQL started below)
 DB_HOST=127.0.0.1
@@ -68,10 +66,10 @@ LIVE_PRICE_TIMEOUT_MS=8000
 
 # Local optimizer (optional, used only if prefer=local)
 OPTIMIZER_PY=/home/ubuntu/venvs/optimizer/bin/python
-EOF
+EOT
 
 # 2) start MySQL via Docker (data persisted to ./mysql-data)
-cat > docker-compose.yml <<'EOF'
+cat > docker-compose.yml <<'EOT'
 version: "3.9"
 services:
   mysql:
@@ -88,10 +86,10 @@ services:
     volumes:
       - ./mysql-data:/var/lib/mysql
       - ./init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
-EOF
+EOT
 
 # 3) write init.sql (minimal schema)
-cat > init.sql <<'EOF'
+cat > init.sql <<'EOT'
 CREATE TABLE IF NOT EXISTS sensor_power_raw (
   id BIGINT AUTO_INCREMENT PRIMARY KEY,
   user_id BIGINT NULL,
@@ -119,7 +117,7 @@ CREATE TABLE IF NOT EXISTS used_fac (
 CREATE TABLE IF NOT EXISTS facilities (
   fac_id VARCHAR(64) PRIMARY KEY
 );
-EOF
+EOT
 
 # 4) bring up DB
 docker compose up -d
@@ -129,26 +127,30 @@ docker compose up -d
 npm i
 node index.cjs
 # API listens on :4000
-
-Health & Sanity Checks
+Health & Sanity Checks (non-clickable)
+bash
+복사
+편집
 curl -s http://127.0.0.1:4000/healthz
 curl -s http://127.0.0.1:4000/api/healthz
-
-NGINX (HTTPS reverse proxy)
+NGINX (HTTPS reverse proxy) (non-clickable)
+nginx
+복사
+편집
 server {
   listen 80;
   listen [::]:80;
-  server_name api.sensor-tive.com;
+  server_name `api.sensor-tive.com`;
   return 301 https://$host$request_uri;
 }
 
 server {
   listen 443 ssl http2;
   listen [::]:443 ssl http2;
-  server_name api.sensor-tive.com;
+  server_name `api.sensor-tive.com`;
 
-  ssl_certificate     /etc/letsencrypt/live/api.sensor-tive.com/fullchain.pem;
-  ssl_certificate_key /etc/letsencrypt/live/api.sensor-tive.com/privkey.pem;
+  ssl_certificate     /etc/letsencrypt/live/`api.sensor-tive.com`/fullchain.pem;
+  ssl_certificate_key /etc/letsencrypt/live/`api.sensor-tive.com`/privkey.pem;
 
   location /api/ {
     proxy_pass         http://127.0.0.1:4000/;
@@ -163,8 +165,10 @@ server {
     proxy_pass http://127.0.0.1:4000/healthz;
   }
 }
-
-Systemd (EC2)
+Systemd (EC2) (non-clickable)
+ini
+복사
+편집
 # /etc/systemd/system/smartfactory-backend.service
 [Unit]
 Description=SmartFactory Backend
@@ -181,67 +185,81 @@ Group=ubuntu
 
 [Install]
 WantedBy=multi-user.target
+Enable & start:
 
+bash
+복사
+편집
 sudo systemctl daemon-reload
 sudo systemctl enable smartfactory-backend
 sudo systemctl restart smartfactory-backend
 journalctl -u smartfactory-backend -f
-
-API Map (actual)
-
+API Map (non-clickable Base URL)
 Base URL: https://api.sensor-tive.com
 
-# Health
-GET  /healthz
-GET  /api/healthz
+Health
+GET /healthz
 
-# Auth
-GET  /auth/
+GET /api/healthz
+
+Auth
+GET /auth/
+
 POST /auth/register
+
 POST /auth/login
-GET  /auth/me
+
+GET /auth/me
+
 POST /auth/logout
 
-# Equipment / Line order
-GET  /api/equipment/order
+Equipment / Line order
+GET /api/equipment/order
+
 POST /api/equipment/order
 
-# Power type (per user)
-GET  /api/powertype/:userId
+Power type (per user)
+GET /api/powertype/:userId
+
 POST /api/powertype/:userId
 
-# Power custom aggregation
-GET  /api/power-custom/meta
-GET  /api/power-custom/day
+Power custom aggregation
+GET /api/power-custom/meta
+
+GET /api/power-custom/day
+
 POST /api/power-custom/range
 
-# Power data aggregation
-GET  /api/power-data/weekly
-GET  /api/power-data/monthly
+Power data aggregation
+GET /api/power-data/weekly
 
-# Live price (Lambda: forecast_lstm)
-GET  /api/live/price
+GET /api/power-data/monthly
 
-# Alerts
-GET  /api/alerts/peak
+Live price (Lambda: forecast_lstm)
+GET /api/live/price
 
-# Work scheduling simulator
-GET  /api/worksimul/ping
+Alerts
+GET /api/alerts/peak
+
+Work scheduling simulator
+GET /api/worksimul/ping
+
 POST /api/worksimul
 
 2) 한국어
 개요
-
 IoT 기반 스마트팩토리 백엔드입니다. 인증, 전력 데이터 집계/조회, 실시간 가격, 알림, 스케줄 최적화(람다/로컬 파이썬)를 제공합니다.
 
-즉시 실행(복붙)
+즉시 실행(복붙) (클릭 방지)
+bash
+복사
+편집
 cd backend
 
-# .env 생성(수정 불필요)
-cat > .env <<'EOF'
+cat > .env <<'EOT'
 PORT=4000
 NODE_ENV=production
-CORS_ORIGIN=https://api.sensor-tive.com
+CORS_ORIGIN=`https://api.sensor-tive.com`
 DB_HOST=127.0.0.1
 DB_USER=sf_user
 DB_PASS=sf_pass_2025!
@@ -255,66 +273,19 @@ LAMBDA_ALIAS=
 ALERTS_ENABLED=0
 LIVE_PRICE_TIMEOUT_MS=8000
 OPTIMIZER_PY=/home/ubuntu/venvs/optimizer/bin/python
-EOF
-
-# Docker MySQL + 초기 스키마
-cat > docker-compose.yml <<'EOF'
-version: "3.9"
-services:
-  mysql:
-    image: mysql:8.0
-    container_name: sf-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: root_2025!
-      MYSQL_DATABASE: smartfactory
-      MYSQL_USER: sf_user
-      MYSQL_PASSWORD: sf_pass_2025!
-    ports:
-      - "3306:3306"
-    volumes:
-      - ./mysql-data:/var/lib/mysql
-      - ./init.sql:/docker-entrypoint-initdb.d/00-init.sql:ro
-EOF
-
-cat > init.sql <<'EOF'
-CREATE TABLE IF NOT EXISTS sensor_power_raw (
-  id BIGINT AUTO_INCREMENT PRIMARY KEY,
-  user_id BIGINT NULL,
-  device_id VARCHAR(64) NOT NULL,
-  voltage FLOAT, current FLOAT, power_w FLOAT,
-  Timestamp TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  KEY (user_id), KEY (device_id), KEY (Timestamp)
-);
-CREATE TABLE IF NOT EXISTS power_type (
-  user_id BIGINT PRIMARY KEY,
-  grp VARCHAR(32) NOT NULL,
-  typ VARCHAR(32) NOT NULL,
-  updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-);
-CREATE TABLE IF NOT EXISTS used_fac (
-  user_id BIGINT NOT NULL,
-  product_id VARCHAR(64) NOT NULL,
-  fac_id VARCHAR(64) NOT NULL,
-  line_order INT NOT NULL DEFAULT 0,
-  PRIMARY KEY (user_id, product_id, fac_id)
-);
-CREATE TABLE IF NOT EXISTS facilities ( fac_id VARCHAR(64) PRIMARY KEY );
-EOF
+EOT
 
 docker compose up -d
-
 npm i
 node index.cjs
-
-헬스 체크
+헬스 체크 (클릭 방지)
+bash
+복사
+편집
 curl -s http://127.0.0.1:4000/healthz
 curl -s http://127.0.0.1:4000/api/healthz
+NGINX / Systemd
+위 블록 그대로 사용(도메인/인증서 경로는 코드표기 처리됨).
 
-NGINX (HTTPS 프록시)
-
-위 블록 그대로 사용(도메인/인증서 경로 고정됨).
-
-Systemd (EC2)
-
-위 블록 그대로 사용 후 systemctl 명령 복붙 실행.
+Note: 이 문서는 발표용 안전 버전입니다. 실제 접속 테스트는 원본 README 또는 운영 문서를 사용하세요.
+EOF

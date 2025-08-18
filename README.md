@@ -28,11 +28,9 @@ backend/
 ├─ .env # environment
 └─ package.json # dependencies (no scripts required)
 
-sql
-복사
-편집
 
-### One-shot Setup & Run (non-clickable)
+
+### One-shot Setup & Run 
 ```bash
 # 0) move into backend
 cd backend
@@ -128,15 +126,11 @@ npm i
 node index.cjs
 # API listens on :4000
 Health & Sanity Checks (non-clickable)
-bash
-복사
-편집
+
 curl -s http://127.0.0.1:4000/healthz
 curl -s http://127.0.0.1:4000/api/healthz
 NGINX (HTTPS reverse proxy) (non-clickable)
-nginx
-복사
-편집
+
 server {
   listen 80;
   listen [::]:80;
@@ -165,10 +159,8 @@ server {
     proxy_pass http://127.0.0.1:4000/healthz;
   }
 }
-Systemd (EC2) (non-clickable)
-ini
-복사
-편집
+Systemd (EC2) 
+
 # /etc/systemd/system/smartfactory-backend.service
 [Unit]
 Description=SmartFactory Backend
@@ -187,9 +179,7 @@ Group=ubuntu
 WantedBy=multi-user.target
 Enable & start:
 
-bash
-복사
-편집
+
 sudo systemctl daemon-reload
 sudo systemctl enable smartfactory-backend
 sudo systemctl restart smartfactory-backend
@@ -250,10 +240,7 @@ POST /api/worksimul
 개요
 IoT 기반 스마트팩토리 백엔드입니다. 인증, 전력 데이터 집계/조회, 실시간 가격, 알림, 스케줄 최적화(람다/로컬 파이썬)를 제공합니다.
 
-즉시 실행(복붙) (클릭 방지)
-bash
-복사
-편집
+
 cd backend
 
 cat > .env <<'EOT'
@@ -278,14 +265,11 @@ EOT
 docker compose up -d
 npm i
 node index.cjs
-헬스 체크 (클릭 방지)
-bash
-복사
-편집
+헬스 체크
+
 curl -s http://127.0.0.1:4000/healthz
 curl -s http://127.0.0.1:4000/api/healthz
 NGINX / Systemd
-위 블록 그대로 사용(도메인/인증서 경로는 코드표기 처리됨).
+위 블록 그대로 사용.
 
-Note: 이 문서는 발표용 안전 버전입니다. 실제 접속 테스트는 원본 README 또는 운영 문서를 사용하세요.
 EOF

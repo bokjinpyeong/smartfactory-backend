@@ -1,764 +1,722 @@
 """
-스마트팩토리 에너지 관리 시스템 데이터 전처리 모듈
-"""
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Union, Any
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-import warnings
+스마트팩토리 에너지 관리 시스템 - 데이터 전처리 모듈
 
+확장 가능한 데이터 전처리 파이프라인
+- 스트리밍/배치 하이브리드 처리
+- 모듈화된 전처리 단계
+- 장애 허용성 및 데이터 품질 보장
+- 실시간 데이터 정제 및 변환
+"""
+
+import numpy as np
+import pandas as pd
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Union, Callable, Any
+from dataclasses import dataclass
+from enum import Enum
+import joblib
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.impute import SimpleImputer, KNNImputer
+from scipy import stats
+import warnings
 warnings.filterwarnings('ignore')
 
-from ..core.config import get_config
-from ..core.logger import get_logger, log_performance
-from ..core.exceptions import (
+# Core 모듈
+from core.config import get_config
+from core.logger import get_logger, log_performance
+from core.exceptions import (
     DataProcessingError, DataValidationError,
-    InsufficientDataError, DataCorruptionError
+    InsufficientDataError, safe_execute
 )
 
 
-class DataProcessor:
-    """데이터 전처리 클래스"""
+class ProcessingStage(Enum):
+    """처리 단계 열거형"""
+    RAW = "raw"
+    CLEANED = "cleaned"
+    TRANSFORMED = "transformed"
+    FEATURED = "featured"
+    SCALED = "scaled"
+    READY = "ready"
 
-    def __init__(self):
+
+@dataclass
+class ProcessingResult:
+    """처리 결과 클래스"""
+    data: pd.DataFrame
+    stage: ProcessingStage
+    metadata: Dict[str, Any]
+    processing_time: float
+    error_log: List[str]
+
+    def is_success(self) -> bool:
+        """처리 성공 여부"""
+        return len(self.error_log) == 0
+
+
+class BaseProcessor(ABC):
+    """기본 전처리기 클래스"""
+
+    def __init__(self, processor_name: str):
+        self.processor_name = processor_name
+        self.logger = get_logger(f"processor.{processor_name}")
         self.config = get_config()
-        self.logger = get_logger("data_processor")
-        self.scalers = {}
-        self.encoders = {}
-        self._feature_names = []
+        self.is_fitted = False
+        self.processing_stats = {
+            'total_processed': 0,
+            'success_count': 0,
+            'error_count': 0,
+            'average_processing_time': 0.0
+        }
 
-    @log_performance("data_cleaning")
-    def clean_data(self, data: pd.DataFrame) -> pd.DataFrame:
-        """데이터 정리"""
-        self.logger.info("데이터 정리 시작",
-                         original_shape=data.shape)
+    @abstractmethod
+    def fit(self, data: pd.DataFrame) -> 'BaseProcessor':
+        """전처리기 학습"""
+        pass
+
+    @abstractmethod
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """데이터 변환"""
+        pass
+
+    def fit_transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """학습 후 변환"""
+        return self.fit(data).transform(data)
+
+    @log_performance
+    def process(self, data: pd.DataFrame) -> ProcessingResult:
+        """안전한 데이터 처리"""
+        start_time = datetime.now()
+        error_log = []
 
         try:
-            # 1. 기본 정리
-            data_clean = self._basic_cleaning(data)
+            # 입력 검증
+            self._validate_input(data)
 
-            # 2. 이상치 제거
-            data_clean = self._remove_outliers(data_clean)
+            # 변환 수행
+            processed_data = self.transform(data)
 
-            # 3. 결측치 처리
-            data_clean = self._handle_missing_values(data_clean)
+            # 결과 검증
+            self._validate_output(processed_data)
 
-            # 4. 데이터 타입 최적화
-            data_clean = self._optimize_dtypes(data_clean)
-
-            self.logger.info("데이터 정리 완료",
-                             final_shape=data_clean.shape,
-                             removed_rows=len(data) - len(data_clean))
-
-            return data_clean
+            self.processing_stats['success_count'] += 1
 
         except Exception as e:
-            raise DataProcessingError(
-                "데이터 정리 중 오류 발생",
-                details={'error': str(e), 'data_shape': data.shape}
-            ) from e
+            error_log.append(str(e))
+            processed_data = data.copy()  # 원본 데이터 반환
+            self.processing_stats['error_count'] += 1
+            self.logger.error(f"처리 오류 [{self.processor_name}]: {e}")
 
-    def _basic_cleaning(self, data: pd.DataFrame) -> pd.DataFrame:
-        """기본 데이터 정리"""
-        data_clean = data.copy()
+        finally:
+            # 처리 통계 업데이트
+            processing_time = (datetime.now() - start_time).total_seconds()
+            self.processing_stats['total_processed'] += 1
+            self.processing_stats['average_processing_time'] = (
+                (self.processing_stats['average_processing_time'] *
+                 (self.processing_stats['total_processed'] - 1) + processing_time) /
+                self.processing_stats['total_processed']
+            )
 
-        # 음수 전력 소비 제거
-        if 'Power_Consumption' in data_clean.columns:
-            negative_power = (data_clean['Power_Consumption'] < 0).sum()
-            if negative_power > 0:
-                self.logger.warning(f"음수 전력 소비 제거: {negative_power}개")
-                data_clean = data_clean[data_clean['Power_Consumption'] >= 0]
-
-        # 비현실적인 온도 제거
-        temp_columns = [col for col in data_clean.columns if 'Temperature' in col]
-        for col in temp_columns:
-            before_count = len(data_clean)
-            data_clean = data_clean[
-                (data_clean[col] >= -50) & (data_clean[col] <= 200)
-                ]
-            removed = before_count - len(data_clean)
-            if removed > 0:
-                self.logger.warning(f"비현실적인 온도 제거 ({col}): {removed}개")
-
-        # 중복 제거
-        duplicates = data_clean.duplicated().sum()
-        if duplicates > 0:
-            data_clean = data_clean.drop_duplicates()
-            self.logger.info(f"중복 데이터 제거: {duplicates}개")
-
-        return data_clean
-
-    def _remove_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
-        """이상치 제거"""
-        data_clean = data.copy()
-        numeric_columns = data_clean.select_dtypes(include=[np.number]).columns
-
-        for col in numeric_columns:
-            if col in ['Machine_ID', 'Event_Sequence_Number']:  # ID 컬럼 제외
-                continue
-
-            Q1 = data_clean[col].quantile(0.25)
-            Q3 = data_clean[col].quantile(0.75)
-            IQR = Q3 - Q1
-
-            lower_bound = Q1 - 1.5 * IQR
-            upper_bound = Q3 + 1.5 * IQR
-
-            before_count = len(data_clean)
-            data_clean = data_clean[
-                (data_clean[col] >= lower_bound) & (data_clean[col] <= upper_bound)
-                ]
-            removed = before_count - len(data_clean)
-
-            if removed > 0:
-                self.logger.debug(f"이상치 제거 ({col}): {removed}개")
-
-        return data_clean
-
-    def _handle_missing_values(self, data: pd.DataFrame) -> pd.DataFrame:
-        """결측치 처리"""
-        data_clean = data.copy()
-
-        # 결측치 비율 확인
-        missing_ratio = data_clean.isnull().sum() / len(data_clean)
-        high_missing_cols = missing_ratio[missing_ratio > self.config.data.max_missing_ratio].index
-
-        if len(high_missing_cols) > 0:
-            self.logger.warning(f"결측치 비율이 높은 컬럼 제거: {list(high_missing_cols)}")
-            data_clean = data_clean.drop(columns=high_missing_cols)
-
-        # 수치형 컬럼: 평균값으로 대체
-        numeric_columns = data_clean.select_dtypes(include=[np.number]).columns
-        for col in numeric_columns:
-            if data_clean[col].isnull().sum() > 0:
-                mean_val = data_clean[col].mean()
-                data_clean[col].fillna(mean_val, inplace=True)
-                self.logger.debug(f"결측치 대체 ({col}): 평균값 {mean_val:.2f}")
-
-        # 범주형 컬럼: 최빈값으로 대체
-        categorical_columns = data_clean.select_dtypes(include=['object', 'category']).columns
-        for col in categorical_columns:
-            if data_clean[col].isnull().sum() > 0:
-                mode_val = data_clean[col].mode().iloc[0] if not data_clean[col].mode().empty else 'Unknown'
-                data_clean[col].fillna(mode_val, inplace=True)
-                self.logger.debug(f"결측치 대체 ({col}): 최빈값 {mode_val}")
-
-        return data_clean
-
-    def _optimize_dtypes(self, data: pd.DataFrame) -> pd.DataFrame:
-        """데이터 타입 최적화"""
-        data_optimized = data.copy()
-
-        # Float64 → Float32
-        float_columns = data_optimized.select_dtypes(include=['float64']).columns
-        if len(float_columns) > 0:
-            data_optimized[float_columns] = data_optimized[float_columns].astype('float32')
-            self.logger.debug(f"Float32로 변환: {len(float_columns)}개 컬럼")
-
-        # 정수형 최적화
-        int_columns = ['Shaft_Alignment_Status', 'Failure_Occurrence', 'Event_Sequence_Number']
-        for col in int_columns:
-            if col in data_optimized.columns:
-                data_optimized[col] = data_optimized[col].astype('int16')
-
-        # 카테고리형 변환
-        categorical_columns = [
-            'Machine_ID', 'Machine_Type', 'Production_Line_ID',
-            'Operational_Mode', 'Job_Code', 'Shift_Code',
-            'Operator_ID', 'Machine_Location_Zone'
-        ]
-        for col in categorical_columns:
-            if col in data_optimized.columns:
-                data_optimized[col] = data_optimized[col].astype('category')
-
-        # 메모리 사용량 로깅
-        memory_usage = data_optimized.memory_usage(deep=True).sum() / 1024 ** 2
-        self.logger.info(f"최적화 후 메모리 사용량: {memory_usage:.2f} MB")
-
-        return data_optimized
-
-    @log_performance("realistic_power_model")
-    def create_realistic_power_model(self, data: pd.DataFrame) -> pd.DataFrame:
-        """물리 법칙을 반영한 현실적인 전력 소비 계산"""
-        self.logger.info("현실적인 전력 소비 모델 생성")
-
-        data_with_realistic = data.copy()
-
-        def calculate_realistic_power(row):
-            # 기본 소비 전력 (기계 타입별)
-            base_power = {
-                'CNC': 500, 'Lathe': 300, 'Mill': 400, 'Drill': 200
-            }
-
-            machine_type = row.get('Machine_Type', 'CNC')
-            base = base_power.get(machine_type, 400)
-
-            # 부하에 따른 전력 (토크 × RPM = 기계적 파워)
-            mechanical_power = (row['Load_Torque'] * row['Shaft_Speed_RPM']) / 1000000
-            load_power = mechanical_power * 1000 * 0.8  # 80% 효율
-
-            # 온도에 따른 추가 소모 (냉각 시스템)
-            temp_excess = max(0, row['Motor_Temperature'] - 80)
-            cooling_power = temp_excess * 2
-
-            # 진동에 따른 비효율성
-            vibration_penalty = row['RMS_Vibration'] * 10
-
-            # 역률에 따른 효율성
-            power_factor = max(0.5, row['Power_Factor'])
-            efficiency_factor = power_factor
-
-            # 작업 부하율 반영
-            workload_factor = row['Workload_Percentage'] / 100
-
-            # 최종 계산
-            total_power = (base + load_power + cooling_power + vibration_penalty) * workload_factor / efficiency_factor
-
-            # 랜덤 노이즈 추가 (±5%)
-            noise = np.random.normal(1, 0.05)
-            total_power *= noise
-
-            return max(50, total_power)  # 최소 50W
-
-        # 새로운 현실적인 전력 소비 계산
-        data_with_realistic['Power_Consumption_Realistic'] = data_with_realistic.apply(
-            calculate_realistic_power, axis=1
+        return ProcessingResult(
+            data=processed_data,
+            stage=self._get_stage(),
+            metadata=self._get_metadata(),
+            processing_time=processing_time,
+            error_log=error_log
         )
 
-        # 통계 정보 로깅
-        original_mean = data_with_realistic['Power_Consumption'].mean()
-        realistic_mean = data_with_realistic['Power_Consumption_Realistic'].mean()
-
-        self.logger.info("현실적인 전력 모델 생성 완료",
-                         original_mean=original_mean,
-                         realistic_mean=realistic_mean,
-                         difference_percent=(realistic_mean - original_mean) / original_mean * 100)
-
-        return data_with_realistic
-
-    @log_performance("feature_engineering")
-    def engineer_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """피처 엔지니어링"""
-        self.logger.info("피처 엔지니어링 시작")
-
-        data_engineered = data.copy()
-
-        try:
-            # 1. 시계열 피처
-            data_engineered = self._create_time_features(data_engineered)
-
-            # 2. 파생 변수
-            data_engineered = self._create_derived_features(data_engineered)
-
-            # 3. 상호작용 피처
-            data_engineered = self._create_interaction_features(data_engineered)
-
-            # 4. 카테고리 인코딩
-            data_engineered = self._encode_categorical_features(data_engineered)
-
-            self.logger.info("피처 엔지니어링 완료",
-                             original_features=data.shape[1],
-                             final_features=data_engineered.shape[1])
-
-            return data_engineered
-
-        except Exception as e:
-            raise DataProcessingError(
-                "피처 엔지니어링 중 오류 발생",
-                details={'error': str(e)}
-            ) from e
-
-    def _create_time_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """시계열 피처 생성"""
-        if 'Timestamp' not in data.columns:
-            return data
-
-        data_with_time = data.copy()
-        data_with_time['Timestamp'] = pd.to_datetime(data_with_time['Timestamp'])
-
-        # 시간 관련 피처
-        data_with_time['Hour'] = data_with_time['Timestamp'].dt.hour
-        data_with_time['Day_of_Week'] = data_with_time['Timestamp'].dt.dayofweek
-        data_with_time['Month'] = data_with_time['Timestamp'].dt.month
-        data_with_time['Is_Weekend'] = (data_with_time['Day_of_Week'] >= 5).astype(int)
-
-        # TOU 요금제 시간대
-        def get_time_price_factor(hour):
-            if hour in self.config.power.tou_peak_hours:
-                return self.config.power.tou_peak_rate
-            elif hour in self.config.power.tou_off_peak_hours:
-                return self.config.power.tou_off_peak_rate
-            else:
-                return self.config.power.tou_normal_rate
-
-        data_with_time['Time_Price_Factor'] = data_with_time['Hour'].apply(get_time_price_factor)
-
-        self.logger.debug("시계열 피처 생성 완료")
-        return data_with_time
-
-    def _create_derived_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """파생 변수 생성"""
-        data_derived = data.copy()
-
-        # 전력 효율성 지표
-        if 'Power_Consumption_Realistic' in data_derived.columns and 'Mechanical_Power' in data_derived.columns:
-            data_derived['Power_Efficiency'] = data_derived['Power_Consumption_Realistic'] / (
-                        data_derived['Mechanical_Power'] + 1)
-
-        # 온도 이상 플래그
-        if 'Motor_Temperature' in data_derived.columns:
-            data_derived['High_Temperature_Flag'] = (data_derived['Motor_Temperature'] > 130).astype(int)
-
-        # 부하 수준 카테고리
-        if 'Workload_Percentage' in data_derived.columns:
-            data_derived['Load_Category'] = pd.cut(
-                data_derived['Workload_Percentage'],
-                bins=[0, 30, 70, 100],
-                labels=['Low', 'Medium', 'High']
-            )
-
-        # 종합 전력 지표
-        if all(col in data_derived.columns for col in ['Current_Phase_A', 'Current_Phase_B', 'Current_Phase_C']):
-            data_derived['Total_Current'] = (
-                    data_derived['Current_Phase_A'] +
-                    data_derived['Current_Phase_B'] +
-                    data_derived['Current_Phase_C']
-            )
-
-        if all(col in data_derived.columns for col in ['Voltage_Phase_A', 'Voltage_Phase_B', 'Voltage_Phase_C']):
-            data_derived['Average_Voltage'] = (
-                                                      data_derived['Voltage_Phase_A'] +
-                                                      data_derived['Voltage_Phase_B'] +
-                                                      data_derived['Voltage_Phase_C']
-                                              ) / 3
-
-        # 기계적 파워
-        if 'Load_Torque' in data_derived.columns and 'Shaft_Speed_RPM' in data_derived.columns:
-            data_derived['Mechanical_Power'] = data_derived['Load_Torque'] * data_derived['Shaft_Speed_RPM'] / 1000
-
-        self.logger.debug("파생 변수 생성 완료")
-        return data_derived
-
-    def _create_interaction_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """상호작용 피처 생성"""
-        data_interaction = data.copy()
-
-        # 온도와 부하의 상호작용
-        if 'Motor_Temperature' in data_interaction.columns and 'Workload_Percentage' in data_interaction.columns:
-            data_interaction['Temp_Load_Interaction'] = (
-                    data_interaction['Motor_Temperature'] * data_interaction['Workload_Percentage'] / 100
-            )
-
-        # 진동과 속도의 상호작용
-        if 'RMS_Vibration' in data_interaction.columns and 'Shaft_Speed_RPM' in data_interaction.columns:
-            data_interaction['Vibration_Speed_Interaction'] = (
-                    data_interaction['RMS_Vibration'] * data_interaction['Shaft_Speed_RPM'] / 1000
-            )
-
-        self.logger.debug("상호작용 피처 생성 완료")
-        return data_interaction
-
-    def _encode_categorical_features(self, data: pd.DataFrame) -> pd.DataFrame:
-        """카테고리 피처 인코딩"""
-        data_encoded = data.copy()
-
-        categorical_features = ['Machine_ID', 'Machine_Type', 'Operational_Mode', 'Load_Category']
-
-        for col in categorical_features:
-            if col in data_encoded.columns:
-                if col not in self.encoders:
-                    self.encoders[col] = LabelEncoder()
-                    data_encoded[f'{col}_encoded'] = self.encoders[col].fit_transform(data_encoded[col].astype(str))
-                else:
-                    # 기존 인코더 사용 (새로운 값 처리)
-                    try:
-                        data_encoded[f'{col}_encoded'] = self.encoders[col].transform(data_encoded[col].astype(str))
-                    except ValueError:
-                        # 새로운 카테고리 값이 있는 경우 처리
-                        known_classes = set(self.encoders[col].classes_)
-                        data_values = set(data_encoded[col].astype(str).unique())
-                        new_values = data_values - known_classes
-
-                        if new_values:
-                            self.logger.warning(f"새로운 카테고리 값 발견 ({col}): {new_values}")
-                            # 인코더 재학습
-                            self.encoders[col] = LabelEncoder()
-                            data_encoded[f'{col}_encoded'] = self.encoders[col].fit_transform(
-                                data_encoded[col].astype(str))
-
-        self.logger.debug("카테고리 인코딩 완료")
-        return data_encoded
-
-    @log_performance("data_scaling")
-    def scale_features(self, data: pd.DataFrame, fit: bool = True) -> pd.DataFrame:
-        """피처 스케일링"""
-        self.logger.info("피처 스케일링 시작")
-
-        data_scaled = data.copy()
-
-        # 스케일링할 수치형 컬럼 선택
-        numeric_columns = data_scaled.select_dtypes(include=[np.number]).columns
-        exclude_columns = ['Machine_ID', 'Event_Sequence_Number'] + [col for col in numeric_columns if
-                                                                     col.endswith('_encoded')]
-
-        scale_columns = [col for col in numeric_columns if col not in exclude_columns]
-
-        if len(scale_columns) == 0:
-            self.logger.warning("스케일링할 컬럼이 없습니다")
-            return data_scaled
-
-        # 스케일러 선택
-        if self.config.data.scaling_method == 'standard':
-            scaler_class = StandardScaler
-        elif self.config.data.scaling_method == 'minmax':
-            scaler_class = MinMaxScaler
-        else:
-            raise DataValidationError(f"지원하지 않는 스케일링 방법: {self.config.data.scaling_method}")
-
-        # 스케일링 수행
-        if fit:
-            self.scalers['feature_scaler'] = scaler_class()
-            data_scaled[scale_columns] = self.scalers['feature_scaler'].fit_transform(data_scaled[scale_columns])
-            self.logger.info(f"스케일러 학습 및 변환 완료 ({self.config.data.scaling_method})")
-        else:
-            if 'feature_scaler' not in self.scalers:
-                raise DataProcessingError("스케일러가 학습되지 않았습니다. fit=True로 먼저 실행하세요.")
-            data_scaled[scale_columns] = self.scalers['feature_scaler'].transform(data_scaled[scale_columns])
-            self.logger.info("기존 스케일러로 변환 완료")
-
-        return data_scaled
-
-    @log_performance("data_splitting")
-    def split_data(
-            self,
-            data: pd.DataFrame,
-            target_col: str = 'Power_Consumption_Realistic',
-            features: Optional[List[str]] = None
-    ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-        """데이터 분할"""
-        self.logger.info("데이터 분할 시작",
-                         target_column=target_col,
-                         total_samples=len(data))
-
-        if target_col not in data.columns:
-            raise DataValidationError(f"타겟 컬럼을 찾을 수 없습니다: {target_col}")
-
-        # 피처 선택
-        if features is None:
-            features = self._select_final_features(data, target_col)
-
-        # 존재하는 피처만 필터링
-        available_features = [f for f in features if f in data.columns]
-        if len(available_features) != len(features):
-            missing_features = set(features) - set(available_features)
-            self.logger.warning(f"일부 피처를 찾을 수 없습니다: {missing_features}")
-
-        if len(available_features) == 0:
-            raise DataProcessingError("사용할 수 있는 피처가 없습니다")
-
-        # 피처와 타겟 분리
-        X = data[available_features].copy()
-        y = data[target_col].copy()
-
-        # 결측치 제거
-        mask = ~(X.isnull().any(axis=1) | y.isnull())
-        X_clean = X[mask]
-        y_clean = y[mask]
-
-        if len(X_clean) == 0:
-            raise InsufficientDataError("결측치 제거 후 데이터가 없습니다")
-
-        # 데이터 분할
-        try:
-            # Train/Test 분할
-            X_temp, X_test, y_temp, y_test = train_test_split(
-                X_clean, y_clean,
-                test_size=self.config.data.test_ratio,
-                random_state=42,
-                stratify=None  # 회귀 문제이므로 stratify 사용 안함
-            )
-
-            # Train/Validation 분할
-            val_ratio_adjusted = self.config.data.val_ratio / (1 - self.config.data.test_ratio)
-            X_train, X_val, y_train, y_val = train_test_split(
-                X_temp, y_temp,
-                test_size=val_ratio_adjusted,
-                random_state=42
-            )
-
-            # 피처 이름 저장
-            self._feature_names = list(X_train.columns)
-
-            self.logger.info("데이터 분할 완료",
-                             train_samples=len(X_train),
-                             val_samples=len(X_val),
-                             test_samples=len(X_test),
-                             features_count=len(self._feature_names))
-
-            return X_train, X_val, X_test, y_train, y_val, y_test
-
-        except Exception as e:
-            raise DataProcessingError(
-                "데이터 분할 중 오류 발생",
-                details={'error': str(e), 'data_shape': X_clean.shape}
-            ) from e
-
-    def _select_final_features(self, data: pd.DataFrame, target_col: str) -> List[str]:
-        """최종 피처 선택"""
-        # 강한 상관관계 피처들
-        core_features = [
-            'Mechanical_Power', 'Workload_Percentage', 'Load_Torque',
-            'Power_Factor', 'Shaft_Speed_RPM', 'Motor_Temperature'
-        ]
-
-        # 시계열 피처
-        time_features = ['Hour', 'Day_of_Week', 'Month', 'Is_Weekend', 'Time_Price_Factor']
-
-        # 파생 피처
-        derived_features = ['Power_Efficiency', 'High_Temperature_Flag']
-
-        # 인코딩된 피처
-        encoded_features = [col for col in data.columns if col.endswith('_encoded')]
-
-        # 모든 피처 결합
-        all_features = core_features + time_features + derived_features + encoded_features
-
-        # 실제 존재하는 피처만 선택
-        final_features = [f for f in all_features if f in data.columns and f != target_col]
-
-        self.logger.info(f"선택된 피처 수: {len(final_features)}")
-        return final_features
-
-    def get_feature_names(self) -> List[str]:
-        """피처 이름 반환"""
-        return self._feature_names.copy()
-
-    def get_scalers(self) -> Dict:
-        """스케일러 반환"""
-        return self.scalers.copy()
-
-    def get_encoders(self) -> Dict:
-        """인코더 반환"""
-        return self.encoders.copy()
-
-    @log_performance("data_validation")
-    def validate_data(self, data: pd.DataFrame) -> Dict[str, Any]:
-        """데이터 검증"""
-        self.logger.info("데이터 검증 시작")
-
-        validation_report = {
-            'is_valid': True,
-            'issues': [],
-            'statistics': {},
-            'warnings': []
+    def _validate_input(self, data: pd.DataFrame):
+        """입력 데이터 검증"""
+        if data is None or data.empty:
+            raise DataValidationError("입력 데이터가 비어있음")
+
+        required_columns = self._get_required_columns()
+        missing_columns = [col for col in required_columns if col not in data.columns]
+        if missing_columns:
+            raise DataValidationError(f"필수 컬럼 누락: {missing_columns}")
+
+    def _validate_output(self, data: pd.DataFrame):
+        """출력 데이터 검증"""
+        if data is None or data.empty:
+            raise DataProcessingError("처리 결과가 비어있음")
+
+    @abstractmethod
+    def _get_required_columns(self) -> List[str]:
+        """필수 컬럼 목록"""
+        pass
+
+    @abstractmethod
+    def _get_stage(self) -> ProcessingStage:
+        """현재 처리 단계"""
+        pass
+
+    def _get_metadata(self) -> Dict[str, Any]:
+        """메타데이터 반환"""
+        return {
+            'processor_name': self.processor_name,
+            'is_fitted': self.is_fitted,
+            'stats': self.processing_stats.copy()
         }
 
-        try:
-            # 1. 기본 통계
-            validation_report['statistics'] = {
-                'total_rows': len(data),
-                'total_columns': data.shape[1],
-                'memory_usage_mb': data.memory_usage(deep=True).sum() / 1024 ** 2,
-                'missing_values': data.isnull().sum().sum(),
-                'duplicate_rows': data.duplicated().sum()
-            }
 
-            # 2. 필수 컬럼 확인
-            required_columns = ['Power_Consumption', 'Machine_ID', 'Timestamp']
-            missing_required = [col for col in required_columns if col not in data.columns]
-            if missing_required:
-                validation_report['issues'].append({
-                    'type': 'missing_required_columns',
-                    'details': missing_required
-                })
-                validation_report['is_valid'] = False
+class DataCleaner(BaseProcessor):
+    """데이터 정제 처리기"""
 
-            # 3. 데이터 타입 확인
-            numeric_columns = data.select_dtypes(include=[np.number]).columns
-            if len(numeric_columns) == 0:
-                validation_report['issues'].append({
-                    'type': 'no_numeric_columns',
-                    'details': 'numeric columns not found'
-                })
-                validation_report['is_valid'] = False
+    def __init__(self):
+        super().__init__("data_cleaner")
+        self.outlier_detector = None
+        self.imputer = None
+        self.outlier_threshold = 3.0
 
-            # 4. 값 범위 확인
-            for col in numeric_columns:
-                if 'Power' in col:
-                    negative_count = (data[col] < 0).sum()
-                    if negative_count > 0:
-                        validation_report['warnings'].append({
-                            'type': 'negative_power_values',
-                            'column': col,
-                            'count': negative_count
-                        })
+    def fit(self, data: pd.DataFrame) -> 'DataCleaner':
+        """정제기 학습"""
+        self.logger.info("데이터 정제기 학습 시작")
 
-                if 'Temperature' in col:
-                    extreme_count = ((data[col] < -50) | (data[col] > 200)).sum()
-                    if extreme_count > 0:
-                        validation_report['warnings'].append({
-                            'type': 'extreme_temperature_values',
-                            'column': col,
-                            'count': extreme_count
-                        })
-
-            # 5. 결측치 비율 확인
-            missing_ratios = data.isnull().sum() / len(data)
-            high_missing = missing_ratios[missing_ratios > self.config.data.max_missing_ratio]
-            if len(high_missing) > 0:
-                validation_report['warnings'].append({
-                    'type': 'high_missing_ratio',
-                    'columns': high_missing.to_dict()
-                })
-
-            # 6. 데이터 충분성 확인
-            if len(data) < 1000:
-                validation_report['warnings'].append({
-                    'type': 'insufficient_data',
-                    'current_size': len(data),
-                    'recommended_minimum': 1000
-                })
-
-            self.logger.info("데이터 검증 완료",
-                             is_valid=validation_report['is_valid'],
-                             issues_count=len(validation_report['issues']),
-                             warnings_count=len(validation_report['warnings']))
-
-            return validation_report
-
-        except Exception as e:
-            validation_report['is_valid'] = False
-            validation_report['issues'].append({
-                'type': 'validation_error',
-                'details': str(e)
-            })
-            return validation_report
-
-    def create_data_summary(self, data: pd.DataFrame) -> Dict[str, Any]:
-        """데이터 요약 정보 생성"""
-        summary = {
-            'basic_info': {
-                'shape': data.shape,
-                'memory_usage_mb': data.memory_usage(deep=True).sum() / 1024 ** 2,
-                'dtypes': data.dtypes.value_counts().to_dict()
-            },
-            'missing_values': data.isnull().sum().to_dict(),
-            'numeric_summary': {},
-            'categorical_summary': {}
-        }
-
-        # 수치형 컬럼 요약
+        # 이상치 감지기 학습
         numeric_columns = data.select_dtypes(include=[np.number]).columns
-        for col in numeric_columns:
-            summary['numeric_summary'][col] = {
-                'mean': float(data[col].mean()),
-                'std': float(data[col].std()),
-                'min': float(data[col].min()),
-                'max': float(data[col].max()),
-                'median': float(data[col].median()),
-                'missing_count': int(data[col].isnull().sum())
-            }
+        if len(numeric_columns) > 0:
+            self.outlier_threshold = self.config.data.outlier_threshold or 3.0
 
-        # 범주형 컬럼 요약
+        # 결측값 대치기 학습
+        if data.isnull().sum().sum() > 0:
+            self.imputer = KNNImputer(n_neighbors=5)
+            self.imputer.fit(data[numeric_columns])
+
+        self.is_fitted = True
+        self.logger.info("데이터 정제기 학습 완료")
+        return self
+
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """데이터 정제"""
+        if not self.is_fitted:
+            raise DataProcessingError("정제기가 학습되지 않음")
+
+        cleaned_data = data.copy()
+
+        # 1. 중복 제거
+        initial_shape = cleaned_data.shape
+        cleaned_data = cleaned_data.drop_duplicates()
+        if cleaned_data.shape[0] != initial_shape[0]:
+            self.logger.info(f"중복 제거: {initial_shape[0] - cleaned_data.shape[0]} 행")
+
+        # 2. 이상치 처리
+        cleaned_data = self._handle_outliers(cleaned_data)
+
+        # 3. 결측값 처리
+        cleaned_data = self._handle_missing_values(cleaned_data)
+
+        # 4. 데이터 타입 정규화
+        cleaned_data = self._normalize_dtypes(cleaned_data)
+
+        return cleaned_data
+
+    def _handle_outliers(self, data: pd.DataFrame) -> pd.DataFrame:
+        """이상치 처리"""
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+
+        for col in numeric_columns:
+            if col in ['timestamp', 'machine_id', 'sensor_id']:
+                continue
+
+            # Z-score 기반 이상치 감지
+            z_scores = np.abs(stats.zscore(data[col].dropna()))
+            outlier_mask = z_scores > self.outlier_threshold
+
+            if outlier_mask.sum() > 0:
+                # 이상치를 중앙값으로 대체
+                median_value = data[col].median()
+                data.loc[data[col].index[outlier_mask], col] = median_value
+                self.logger.debug(f"이상치 처리 [{col}]: {outlier_mask.sum()} 개")
+
+        return data
+
+    def _handle_missing_values(self, data: pd.DataFrame) -> pd.DataFrame:
+        """결측값 처리"""
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+
+        if self.imputer and len(numeric_columns) > 0:
+            # 수치형 컬럼 결측값 대치
+            data[numeric_columns] = self.imputer.transform(data[numeric_columns])
+
+        # 범주형 컬럼 결측값 처리
         categorical_columns = data.select_dtypes(include=['object', 'category']).columns
         for col in categorical_columns:
-            value_counts = data[col].value_counts()
-            summary['categorical_summary'][col] = {
-                'unique_count': int(data[col].nunique()),
-                'most_frequent': str(value_counts.index[0]) if len(value_counts) > 0 else None,
-                'most_frequent_count': int(value_counts.iloc[0]) if len(value_counts) > 0 else 0,
-                'missing_count': int(data[col].isnull().sum())
-            }
+            if data[col].isnull().sum() > 0:
+                mode_value = data[col].mode().iloc[0] if not data[col].mode().empty else 'unknown'
+                data[col].fillna(mode_value, inplace=True)
 
-        return summary
+        return data
 
-    def save_preprocessing_artifacts(self, output_dir: str = "artifacts/preprocessing"):
-        """전처리 아티팩트 저장"""
-        import os
-        import joblib
+    def _normalize_dtypes(self, data: pd.DataFrame) -> pd.DataFrame:
+        """데이터 타입 정규화"""
+        # 타임스탬프 컬럼 처리
+        if 'timestamp' in data.columns:
+            data['timestamp'] = pd.to_datetime(data['timestamp'])
 
-        os.makedirs(output_dir, exist_ok=True)
+        # ID 컬럼을 문자열로 변환
+        for col in ['machine_id', 'sensor_id']:
+            if col in data.columns:
+                data[col] = data[col].astype(str)
 
-        # 스케일러 저장
-        if self.scalers:
-            scaler_path = os.path.join(output_dir, "scalers.pkl")
-            joblib.dump(self.scalers, scaler_path)
-            self.logger.info(f"스케일러 저장: {scaler_path}")
+        # 수치형 컬럼 타입 최적화
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+        for col in numeric_columns:
+            if data[col].dtype == 'float64':
+                data[col] = pd.to_numeric(data[col], downcast='float')
+            elif data[col].dtype == 'int64':
+                data[col] = pd.to_numeric(data[col], downcast='integer')
 
-        # 인코더 저장
-        if self.encoders:
-            encoder_path = os.path.join(output_dir, "encoders.pkl")
-            joblib.dump(self.encoders, encoder_path)
-            self.logger.info(f"인코더 저장: {encoder_path}")
+        return data
 
-        # 피처 이름 저장
-        if self._feature_names:
-            feature_path = os.path.join(output_dir, "feature_names.pkl")
-            joblib.dump(self._feature_names, feature_path)
-            self.logger.info(f"피처 이름 저장: {feature_path}")
+    def _get_required_columns(self) -> List[str]:
+        """필수 컬럼 목록"""
+        return []  # 정제기는 모든 컬럼을 처리할 수 있음
 
-    def load_preprocessing_artifacts(self, input_dir: str = "artifacts/preprocessing"):
-        """전처리 아티팩트 로드"""
-        import os
-        import joblib
-
-        # 스케일러 로드
-        scaler_path = os.path.join(input_dir, "scalers.pkl")
-        if os.path.exists(scaler_path):
-            self.scalers = joblib.load(scaler_path)
-            self.logger.info(f"스케일러 로드: {scaler_path}")
-
-        # 인코더 로드
-        encoder_path = os.path.join(input_dir, "encoders.pkl")
-        if os.path.exists(encoder_path):
-            self.encoders = joblib.load(encoder_path)
-            self.logger.info(f"인코더 로드: {encoder_path}")
-
-        # 피처 이름 로드
-        feature_path = os.path.join(input_dir, "feature_names.pkl")
-        if os.path.exists(feature_path):
-            self._feature_names = joblib.load(feature_path)
-            self.logger.info(f"피처 이름 로드: {feature_path}")
+    def _get_stage(self) -> ProcessingStage:
+        """현재 처리 단계"""
+        return ProcessingStage.CLEANED
 
 
-def create_processor() -> DataProcessor:
-    """데이터 프로세서 인스턴스 생성"""
-    return DataProcessor()
+class FeatureEngineer(BaseProcessor):
+    """특성 공학 처리기"""
+
+    def __init__(self):
+        super().__init__("feature_engineer")
+        self.feature_configs = {}
+
+    def fit(self, data: pd.DataFrame) -> 'FeatureEngineer':
+        """특성 공학기 학습"""
+        self.logger.info("특성 공학기 학습 시작")
+
+        # 시계열 특성 설정
+        if 'timestamp' in data.columns:
+            self.feature_configs['temporal_features'] = True
+
+        # 전력 관련 특성 설정
+        power_columns = [col for col in data.columns if 'power' in col.lower()]
+        if power_columns:
+            self.feature_configs['power_features'] = power_columns
+
+        # 통계 특성 설정
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+        self.feature_configs['statistical_features'] = list(numeric_columns)
+
+        self.is_fitted = True
+        self.logger.info("특성 공학기 학습 완료")
+        return self
+
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """특성 생성"""
+        if not self.is_fitted:
+            raise DataProcessingError("특성 공학기가 학습되지 않음")
+
+        featured_data = data.copy()
+
+        # 1. 시간 기반 특성
+        if self.feature_configs.get('temporal_features'):
+            featured_data = self._create_temporal_features(featured_data)
+
+        # 2. 전력 기반 특성
+        if self.feature_configs.get('power_features'):
+            featured_data = self._create_power_features(featured_data)
+
+        # 3. 통계 기반 특성
+        if self.feature_configs.get('statistical_features'):
+            featured_data = self._create_statistical_features(featured_data)
+
+        # 4. 도메인 특화 특성
+        featured_data = self._create_domain_features(featured_data)
+
+        return featured_data
+
+    def _create_temporal_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """시간 기반 특성 생성"""
+        if 'timestamp' not in data.columns:
+            return data
+
+        timestamp_col = pd.to_datetime(data['timestamp'])
+
+        # 기본 시간 특성
+        data['hour'] = timestamp_col.dt.hour
+        data['day_of_week'] = timestamp_col.dt.dayofweek
+        data['month'] = timestamp_col.dt.month
+        data['is_weekend'] = (timestamp_col.dt.dayofweek >= 5).astype(int)
+
+        # 시간대 구분 (피크/오프피크)
+        data['is_peak_hour'] = ((timestamp_col.dt.hour >= 9) &
+                               (timestamp_col.dt.hour <= 17)).astype(int)
+
+        # 작업 시간 구분
+        data['work_shift'] = pd.cut(timestamp_col.dt.hour,
+                                   bins=[0, 8, 16, 24],
+                                   labels=['night', 'day', 'evening'],
+                                   include_lowest=True)
+
+        return data
+
+    def _create_power_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """전력 기반 특성 생성"""
+        power_columns = self.feature_configs.get('power_features', [])
+
+        for col in power_columns:
+            if col in data.columns:
+                # 전력 효율성 지표
+                if 'voltage' in data.columns and 'current' in data.columns:
+                    data['power_factor'] = data[col] / (data['voltage'] * data['current'] + 1e-8)
+                    data['apparent_power'] = data['voltage'] * data['current']
+
+                # 전력 변화율
+                data[f'{col}_change'] = data[col].pct_change().fillna(0)
+
+                # 이동 평균
+                data[f'{col}_ma_5'] = data[col].rolling(window=5, min_periods=1).mean()
+                data[f'{col}_ma_15'] = data[col].rolling(window=15, min_periods=1).mean()
+
+                # 전력 레벨 분류
+                power_quantiles = data[col].quantile([0.25, 0.5, 0.75])
+                data[f'{col}_level'] = pd.cut(data[col],
+                                             bins=[-float('inf')] + power_quantiles.tolist() + [float('inf')],
+                                             labels=['low', 'medium', 'high', 'very_high'])
+
+        return data
+
+    def _create_statistical_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """통계 기반 특성 생성"""
+        numeric_columns = self.feature_configs.get('statistical_features', [])
+
+        # 롤링 윈도우 통계
+        window_sizes = [5, 10, 15]
+
+        for col in numeric_columns:
+            if col in data.columns and col not in ['hour', 'day_of_week', 'month']:
+                for window in window_sizes:
+                    # 롤링 통계
+                    data[f'{col}_std_{window}'] = data[col].rolling(window=window, min_periods=1).std()
+                    data[f'{col}_min_{window}'] = data[col].rolling(window=window, min_periods=1).min()
+                    data[f'{col}_max_{window}'] = data[col].rolling(window=window, min_periods=1).max()
+
+                    # 롤링 변동 계수
+                    rolling_mean = data[col].rolling(window=window, min_periods=1).mean()
+                    rolling_std = data[col].rolling(window=window, min_periods=1).std()
+                    data[f'{col}_cv_{window}'] = rolling_std / (rolling_mean + 1e-8)
+
+        return data
+
+    def _create_domain_features(self, data: pd.DataFrame) -> pd.DataFrame:
+        """도메인 특화 특성 생성"""
+        # 머신별 정규화된 전력 사용량
+        if 'power_consumption' in data.columns and 'machine_id' in data.columns:
+            machine_power_mean = data.groupby('machine_id')['power_consumption'].transform('mean')
+            data['normalized_power'] = data['power_consumption'] / (machine_power_mean + 1e-8)
+
+        # 온도-전력 상관관계
+        if all(col in data.columns for col in ['temperature', 'power_consumption']):
+            data['temp_power_ratio'] = data['temperature'] / (data['power_consumption'] + 1e-8)
+
+        # 가동률 추정
+        if 'power_consumption' in data.columns:
+            # 전력 소비가 최소값의 150% 이상이면 가동 중으로 간주
+            min_power = data['power_consumption'].min()
+            threshold = min_power * 1.5
+            data['is_operating'] = (data['power_consumption'] > threshold).astype(int)
+
+        return data
+
+    def _get_required_columns(self) -> List[str]:
+        """필수 컬럼 목록"""
+        return []  # 유연한 특성 생성
+
+    def _get_stage(self) -> ProcessingStage:
+        """현재 처리 단계"""
+        return ProcessingStage.FEATURED
 
 
-# 편의 함수들
-def quick_clean_data(data: pd.DataFrame) -> pd.DataFrame:
-    """빠른 데이터 정리"""
-    processor = create_processor()
-    return processor.clean_data(data)
+class DataScaler(BaseProcessor):
+    """데이터 스케일링 처리기"""
+
+    def __init__(self, scaling_method: str = "standard"):
+        super().__init__("data_scaler")
+        self.scaling_method = scaling_method
+        self.scalers = {}
+        self.feature_columns = []
+
+    def fit(self, data: pd.DataFrame) -> 'DataScaler':
+        """스케일러 학습"""
+        self.logger.info(f"데이터 스케일러 학습 시작 (방법: {self.scaling_method})")
+
+        # 스케일링할 컬럼 선택 (수치형 컬럼만)
+        numeric_columns = data.select_dtypes(include=[np.number]).columns
+        exclude_columns = ['hour', 'day_of_week', 'month', 'is_weekend', 'is_peak_hour', 'is_operating']
+        self.feature_columns = [col for col in numeric_columns if col not in exclude_columns]
+
+        # 스케일러 생성 및 학습
+        for col in self.feature_columns:
+            if self.scaling_method == "standard":
+                scaler = StandardScaler()
+            elif self.scaling_method == "minmax":
+                scaler = MinMaxScaler()
+            elif self.scaling_method == "robust":
+                scaler = RobustScaler()
+            else:
+                raise ValueError(f"지원하지 않는 스케일링 방법: {self.scaling_method}")
+
+            scaler.fit(data[[col]])
+            self.scalers[col] = scaler
+
+        self.is_fitted = True
+        self.logger.info(f"데이터 스케일러 학습 완료 ({len(self.feature_columns)} 컬럼)")
+        return self
+
+    def transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """데이터 스케일링"""
+        if not self.is_fitted:
+            raise DataProcessingError("스케일러가 학습되지 않음")
+
+        scaled_data = data.copy()
+
+        # 각 컬럼별 스케일링 적용
+        for col in self.feature_columns:
+            if col in scaled_data.columns:
+                scaled_values = self.scalers[col].transform(scaled_data[[col]])
+                scaled_data[col] = scaled_values.flatten()
+
+        return scaled_data
+
+    def inverse_transform(self, data: pd.DataFrame) -> pd.DataFrame:
+        """스케일링 역변환"""
+        if not self.is_fitted:
+            raise DataProcessingError("스케일러가 학습되지 않음")
+
+        original_data = data.copy()
+
+        # 각 컬럼별 역변환 적용
+        for col in self.feature_columns:
+            if col in original_data.columns:
+                original_values = self.scalers[col].inverse_transform(original_data[[col]])
+                original_data[col] = original_values.flatten()
+
+        return original_data
+
+    def _get_required_columns(self) -> List[str]:
+        """필수 컬럼 목록"""
+        return self.feature_columns
+
+    def _get_stage(self) -> ProcessingStage:
+        """현재 처리 단계"""
+        return ProcessingStage.SCALED
 
 
-def quick_feature_engineering(data: pd.DataFrame) -> pd.DataFrame:
-    """빠른 피처 엔지니어링"""
-    processor = create_processor()
-    data_with_realistic = processor.create_realistic_power_model(data)
-    return processor.engineer_features(data_with_realistic)
+class DataProcessingPipeline:
+    """데이터 처리 파이프라인"""
+
+    def __init__(self, processors: List[BaseProcessor] = None):
+        self.logger = get_logger("processing_pipeline")
+        self.config = get_config()
+        self.processors = processors or []
+        self.is_fitted = False
+        self.pipeline_stats = {
+            'total_processed': 0,
+            'success_rate': 0.0,
+            'average_processing_time': 0.0
+        }
+
+    def add_processor(self, processor: BaseProcessor):
+        """전처리기 추가"""
+        self.processors.append(processor)
+        self.logger.info(f"전처리기 추가: {processor.processor_name}")
+
+    def fit(self, data: pd.DataFrame) -> 'DataProcessingPipeline':
+        """파이프라인 학습"""
+        self.logger.info("데이터 처리 파이프라인 학습 시작")
+
+        current_data = data.copy()
+
+        for processor in self.processors:
+            self.logger.info(f"전처리기 학습: {processor.processor_name}")
+            processor.fit(current_data)
+            current_data = processor.transform(current_data)
+
+        self.is_fitted = True
+        self.logger.info("데이터 처리 파이프라인 학습 완료")
+        return self
+
+    @log_performance
+    def transform(self, data: pd.DataFrame) -> ProcessingResult:
+        """데이터 변환"""
+        if not self.is_fitted:
+            raise DataProcessingError("파이프라인이 학습되지 않음")
+
+        start_time = datetime.now()
+        current_data = data.copy()
+        all_errors = []
+        all_metadata = {}
+
+        # 각 전처리기 순차 적용
+        for processor in self.processors:
+            result = processor.process(current_data)
+            current_data = result.data
+            all_errors.extend(result.error_log)
+            all_metadata[processor.processor_name] = result.metadata
+
+        # 파이프라인 통계 업데이트
+        processing_time = (datetime.now() - start_time).total_seconds()
+        self.pipeline_stats['total_processed'] += 1
+
+        success = len(all_errors) == 0
+        if success:
+            self.pipeline_stats['success_rate'] = (
+                (self.pipeline_stats['success_rate'] * (self.pipeline_stats['total_processed'] - 1) + 1) /
+                self.pipeline_stats['total_processed']
+            )
+
+        self.pipeline_stats['average_processing_time'] = (
+            (self.pipeline_stats['average_processing_time'] *
+             (self.pipeline_stats['total_processed'] - 1) + processing_time) /
+            self.pipeline_stats['total_processed']
+        )
+
+        return ProcessingResult(
+            data=current_data,
+            stage=ProcessingStage.READY,
+            metadata={
+                'pipeline_stats': self.pipeline_stats,
+                'processors': all_metadata,
+                'total_processors': len(self.processors)
+            },
+            processing_time=processing_time,
+            error_log=all_errors
+        )
+
+    def fit_transform(self, data: pd.DataFrame) -> ProcessingResult:
+        """학습 후 변환"""
+        self.fit(data)
+        return self.transform(data)
+
+    def save_pipeline(self, filepath: str):
+        """파이프라인 저장"""
+        pipeline_data = {
+            'processors': self.processors,
+            'is_fitted': self.is_fitted,
+            'pipeline_stats': self.pipeline_stats
+        }
+        joblib.dump(pipeline_data, filepath)
+        self.logger.info(f"파이프라인 저장: {filepath}")
+
+    def load_pipeline(self, filepath: str):
+        """파이프라인 로드"""
+        pipeline_data = joblib.load(filepath)
+        self.processors = pipeline_data['processors']
+        self.is_fitted = pipeline_data['is_fitted']
+        self.pipeline_stats = pipeline_data['pipeline_stats']
+        self.logger.info(f"파이프라인 로드: {filepath}")
 
 
-def quick_data_preparation(
-        data: pd.DataFrame,
-        target_col: str = 'Power_Consumption_Realistic'
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.Series, pd.Series, pd.Series]:
-    """전체 데이터 준비 파이프라인"""
-    processor = create_processor()
+class RealTimeProcessor:
+    """실시간 데이터 처리기"""
 
-    # 1. 데이터 정리
-    data_clean = processor.clean_data(data)
+    def __init__(self, pipeline: DataProcessingPipeline):
+        self.logger = get_logger("realtime_processor")
+        self.pipeline = pipeline
+        self.buffer_size = 1000
+        self.data_buffer = []
+        self.processing_interval = 60  # seconds
 
-    # 2. 현실적인 전력 모델 생성
-    data_with_realistic = processor.create_realistic_power_model(data_clean)
+    def add_data(self, data: Union[pd.DataFrame, Dict]):
+        """실시간 데이터 추가"""
+        if isinstance(data, dict):
+            data = pd.DataFrame([data])
 
-    # 3. 피처 엔지니어링
-    data_engineered = processor.engineer_features(data_with_realistic)
+        self.data_buffer.append(data)
 
-    # 4. 스케일링
-    data_scaled = processor.scale_features(data_engineered, fit=True)
+        # 버퍼 크기 제한
+        if len(self.data_buffer) > self.buffer_size:
+            self.data_buffer.pop(0)
 
-    # 5. 데이터 분할
-    return processor.split_data(data_scaled, target_col)
+    def process_buffer(self) -> Optional[ProcessingResult]:
+        """버퍼 데이터 처리"""
+        if not self.data_buffer:
+            return None
+
+        try:
+            # 버퍼 데이터 결합
+            combined_data = pd.concat(self.data_buffer, ignore_index=True)
+
+            # 파이프라인 적용
+            result = self.pipeline.transform(combined_data)
+
+            # 버퍼 클리어
+            self.data_buffer.clear()
+
+            return result
+
+        except Exception as e:
+            self.logger.error(f"실시간 처리 오류: {e}")
+            return None
+
+
+# 팩토리 함수들
+def create_default_pipeline(scaling_method: str = "standard") -> DataProcessingPipeline:
+    """기본 처리 파이프라인 생성"""
+    pipeline = DataProcessingPipeline()
+
+    # 처리 단계 순서대로 추가
+    pipeline.add_processor(DataCleaner())
+    pipeline.add_processor(FeatureEngineer())
+    pipeline.add_processor(DataScaler(scaling_method))
+
+    return pipeline
+
+
+def create_custom_pipeline(processor_configs: List[Dict]) -> DataProcessingPipeline:
+    """사용자 정의 파이프라인 생성"""
+    pipeline = DataProcessingPipeline()
+
+    for config in processor_configs:
+        processor_type = config.get('type')
+        processor_params = config.get('params', {})
+
+        if processor_type == 'cleaner':
+            processor = DataCleaner()
+        elif processor_type == 'feature_engineer':
+            processor = FeatureEngineer()
+        elif processor_type == 'scaler':
+            processor = DataScaler(**processor_params)
+        else:
+            raise ValueError(f"지원하지 않는 전처리기 타입: {processor_type}")
+
+        pipeline.add_processor(processor)
+
+    return pipeline
+
+
+def create_realtime_processor(pipeline: DataProcessingPipeline = None) -> RealTimeProcessor:
+    """실시간 처리기 생성"""
+    if pipeline is None:
+        pipeline = create_default_pipeline()
+
+    return RealTimeProcessor(pipeline)
+
+
+# 사용 예시
+if __name__ == "__main__":
+    # 기본 파이프라인 생성
+    pipeline = create_default_pipeline()
+
+    # 샘플 데이터로 테스트
+    sample_data = pd.DataFrame({
+        'timestamp': pd.date_range('2024-01-01', periods=100, freq='H'),
+        'machine_id': ['machine_1'] * 50 + ['machine_2'] * 50,
+        'power_consumption': np.random.normal(100, 20, 100),
+        'voltage': np.random.normal(220, 10, 100),
+        'current': np.random.normal(0.5, 0.1, 100),
+        'temperature': np.random.normal(25, 5, 100)
+    })
+
+    # 파이프라인 학습 및 변환
+    result = pipeline.fit_transform(sample_data)
+
+    print(f"처리 결과: {result.stage}")
+    print(f"처리 시간: {result.processing_time:.3f}초")
+    print(f"오류 수: {len(result.error_log)}")
+    print(f"결과 데이터 형태: {result.data.shape}")

@@ -1,343 +1,821 @@
-"""
-Power Constraint Scheduler for Smart Factory Energy Management
-Implements peak power constraint-based job scheduling with TOU pricing
-"""
+@dataclass
+class ScheduleResult:
+    """스케줄링 결과"""
+    scheduled_jobs: List[Job]
+    total_cost: float
+    peak_power: float
+    makespan: float  # hours
+    total_delay: float  # hours
+    utilization_rate: float
+    objective_value: float
+    computation_time: float
+    is_feasible: bool
+    constraints_violated: List[str] = field(default_factory=list)
+    optimization_details: Dict = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
 
-import pandas as pd
-import numpy as np
-from typing import Dict, List, Optional, Tuple, Union
-import time
-import logging
-from scipy.optimize import minimize
-from pulp import *
-
-from .tou_pricing import TOUPricingModel
-
-logger = logging.getLogger(__name__)
-
-
-class PowerConstraintScheduler:
-    """피크 전력 제약 기반 작업 스케줄링 - 실제 요금표 연동"""
-
-    def __init__(self, peak_power_limit: float = 1000, contract_power: float = 1200):
-        self.peak_power_limit = peak_power_limit  # kW
-        self.contract_power = contract_power       # 계약전력 kW
-        self.tou_model = TOUPricingModel()
-        self.tou_model.setup_korean_industrial_rates()
-
-    def create_job_data(self, n_jobs: int = 20) -> pd.DataFrame:
-        """작업 데이터 생성 (실제 제조업 기반)"""
-        np.random.seed(42)
-
-        # 실제 제조업 설비별 전력 소비 패턴
-        equipment_profiles = {
-            'CNC': {'power_range': (80, 150), 'time_range': (30, 120)},
-            'Press': {'power_range': (200, 400), 'time_range': (5, 30)},
-            'Furnace': {'power_range': (300, 600), 'time_range': (60, 240)},
-            'Conveyor': {'power_range': (20, 50), 'time_range': (15, 60)},
-            'Welder': {'power_range': (100, 250), 'time_range': (10, 45)},
-            'Compressor': {'power_range': (150, 300), 'time_range': (30, 90)}
+    def get_summary(self) -> Dict:
+        """결과 요약"""
+        return {
+            'total_jobs': len(self.scheduled_jobs),
+            'feasible': self.is_feasible,
+            'total_cost': round(self.total_cost, 2),
+            'peak_power': round(self.peak_power, 2),
+            'makespan_hours': round(self.makespan, 2),
+            'total_delay_hours': round(self.total_delay, 2),
+            'utilization_rate': round(self.utilization_rate, 2),
+            'objective_value': round(self.objective_value, 2),
+            'computation_time': round(self.computation_time, 3),
+            'constraints_violated': len(self.constraints_violated),
+            'timestamp': self.timestamp.isoformat()
         }
 
-        jobs = []
-        for i in range(n_jobs):
-            equipment_type = np.random.choice(list(equipment_profiles.keys()))
-            profile = equipment_profiles[equipment_type]
+    def to_gantt_data(self) -> List[Dict]:
+        """간트 차트용 데이터 변환"""
+        gantt_data = []
 
-            job = {
-                'job_id': f'J_{i+1:02d}',
-                'equipment_type': equipment_type,
-                'processing_time': np.random.randint(*profile['time_range']),  # 분
-                'power_consumption': np.random.uniform(*profile['power_range']),  # kW
-                'arrival_time': np.random.randint(0, 1200),  # 0-1200분 (20시간)
-                'deadline': 1440,  # 24시간 (1440분)
-                'priority': np.random.randint(1, 4),  # 1(높음) - 3(낮음)
-                'setup_time': np.random.randint(5, 20),  # 준비시간
-                'energy_efficiency': np.random.uniform(0.7, 0.95)  # 에너지 효율
-            }
-            jobs.append(job)
-
-        df = pd.DataFrame(jobs)
-        logger.info(f"✅ 실제 제조업 기반 작업 데이터 생성: {len(jobs)}개")
-        logger.info(f"   📊 설비별 분포: {df['equipment_type'].value_counts().to_dict()}")
-
-        return df
-
-    def erd_scheduling(self, jobs_df: pd.DataFrame) -> pd.DataFrame:
-        """ERD (Earliest Release Date) 스케줄링"""
-        # 도착시간 순으로 정렬
-        sorted_jobs = jobs_df.sort_values('arrival_time').copy()
-
-        schedule = []
-        current_time = 0
-
-        for _, job in sorted_jobs.iterrows():
-            start_time = max(current_time, job['arrival_time'])
-            end_time = start_time + job['processing_time']
-
-            schedule.append({
-                'job_id': job['job_id'],
-                'start_time': start_time,
-                'end_time': end_time,
-                'power_consumption': job['power_consumption'],
-                'processing_time': job['processing_time']
-            })
-
-            current_time = end_time
-
-        return pd.DataFrame(schedule)
-
-    def optimize_with_peak_constraint(self, jobs_df: pd.DataFrame, method: str = "lagrange") -> pd.DataFrame:
-        """피크 전력 제약 기반 최적화"""
-
-        if method == "lagrange":
-            return self._lagrange_optimization(jobs_df)
-        elif method == "milp":
-            return self._milp_optimization(jobs_df)
-        else:
-            return self._heuristic_optimization(jobs_df)
-
-    def _lagrange_optimization(self, jobs_df: pd.DataFrame) -> pd.DataFrame:
-        """라그랑주 완화 기법 (논문 알고리즘 단순화)"""
-        logger.info("🔧 라그랑주 완화 기법 적용 중...")
-
-        # ERD 기본 스케줄 생성
-        base_schedule = self.erd_scheduling(jobs_df)
-
-        # 시간대별 전력 사용량 계산
-        hourly_power = self._calculate_hourly_power(base_schedule)
-
-        # 피크 제약 위반 시간대 식별
-        violations = []
-        for hour, power in enumerate(hourly_power):
-            if power > self.peak_power_limit:
-                violations.append({
-                    'hour': hour,
-                    'excess_power': power - self.peak_power_limit,
-                    'price': self.tou_model.get_hourly_price(hour % 24)
+        for job in self.scheduled_jobs:
+            if job.actual_start and job.status != JobStatus.PENDING:
+                gantt_data.append({
+                    'job_id': job.job_id,
+                    'machine_id': job.machine_id,
+                    'start': job.actual_start.isoformat(),
+                    'finish': job.actual_finish.isoformat() if job.actual_finish else None,
+                    'duration': job.processing_time,
+                    'power': job.power_requirement,
+                    'status': job.status.value,
+                    'priority': job.priority
                 })
 
-        if not violations:
-            logger.info("✅ 피크 전력 제약 준수")
-            return base_schedule
+        return gantt_data
 
-        # 위반 시간대의 작업을 저렴한 시간대로 이동
-        optimized_schedule = self._redistribute_jobs(base_schedule, violations)
 
-        return optimized_schedule
+class BaseScheduler(ABC):
+    """기본 스케줄러 클래스"""
 
-    def _milp_optimization(self, jobs_df: pd.DataFrame) -> pd.DataFrame:
-        """혼합 정수 선형 계획법"""
-        logger.info("🔧 MILP 최적화 적용 중...")
+    def __init__(self, scheduler_name: str):
+        self.scheduler_name = scheduler_name
+        self.logger = get_logger(f"scheduler.{scheduler_name}")
+        self.config = get_config()
 
-        try:
-            # PuLP 문제 정의
-            prob = LpProblem("Energy_Cost_Minimization", LpMinimize)
+        # TOU 요금제 모델
+        self.tou_model = TOUPricingModel()
 
-            n_jobs = len(jobs_df)
-            time_slots = list(range(0, 1440, 15))  # 15분 간격
+        # 제약 조건 관리자
+        self.constraint_manager = ConstraintManager()
 
-            # 결정변수: x[i][t] = 작업 i가 시간 t에 시작하는지 여부
-            x = {}
-            for i in range(n_jobs):
-                for t in time_slots:
-                    x[i, t] = LpVariable(f"x_{i}_{t}", cat='Binary')
+        # 스케줄링 통계
+        self.stats = {
+            'total_scheduling': 0,
+            'successful_scheduling': 0,
+            'average_computation_time': 0.0,
+            'average_cost_savings': 0.0
+        }
 
-            # 목적함수: 총 전력비용 최소화
-            total_cost = 0
-            for i in range(n_jobs):
-                job = jobs_df.iloc[i]
-                for t in time_slots:
-                    hour = (t // 60) % 24
-                    price_info = self.tou_model.get_hourly_price(hour)
-                    power = job['power_consumption']
-                    duration = job['processing_time']
-                    total_cost += x[i, t] * power * (duration/60) * price_info['total_price']
+    @abstractmethod
+    def schedule(self, jobs: List[Job], objective: SchedulingObjective) -> ScheduleResult:
+        """스케줄링 수행"""
+        pass
 
-            prob += total_cost
+    def add_constraint(self, constraint):
+        """제약 조건 추가"""
+        self.constraint_manager.add_constraint(constraint)
 
-            # 제약조건 1: 각 작업은 정확히 한 번 스케줄링
-            for i in range(n_jobs):
-                prob += lpSum([x[i, t] for t in time_slots]) == 1
+    def _validate_jobs(self, jobs: List[Job]) -> List[str]:
+        """작업 유효성 검증"""
+        issues = []
 
-            # 제약조건 2: 피크 전력 제약
-            for t in time_slots:
-                power_at_t = 0
-                for i in range(n_jobs):
-                    job = jobs_df.iloc[i]
-                    # 시간 t에서 작업 i가 실행 중인지 확인
-                    for start_t in time_slots:
-                        if start_t <= t < start_t + job['processing_time']:
-                            power_at_t += x[i, start_t] * job['power_consumption']
+        for job in jobs:
+            if job.processing_time <= 0:
+                issues.append(f"작업 {job.job_id}: 처리 시간이 0 이하")
 
-                prob += power_at_t <= self.peak_power_limit
+            if job.power_requirement < 0:
+                issues.append(f"작업 {job.job_id}: 전력 요구량이 음수")
 
-            # 제약조건 3: 도착시간 이후 시작
-            for i in range(n_jobs):
-                job = jobs_df.iloc[i]
-                arrival = job['arrival_time']
-                for t in time_slots:
-                    if t < arrival:
-                        prob += x[i, t] == 0
+            if job.due_date < datetime.now():
+                issues.append(f"작업 {job.job_id}: 납기일이 과거")
 
-            # 문제 해결
-            prob.solve(PULP_CBC_CMD(msg=0))
+            if job.earliest_start and job.latest_finish:
+                if job.earliest_start >= job.latest_finish:
+                    issues.append(f"작업 {job.job_id}: 시작 시간이 완료 시간 이후")
 
-            # 결과 추출
-            if prob.status == 1:  # Optimal
-                schedule = []
-                for i in range(n_jobs):
-                    job = jobs_df.iloc[i]
-                    for t in time_slots:
-                        if x[i, t].varValue == 1:
-                            schedule.append({
-                                'job_id': job['job_id'],
-                                'start_time': t,
-                                'end_time': t + job['processing_time'],
-                                'power_consumption': job['power_consumption'],
-                                'processing_time': job['processing_time']
-                            })
-                            break
+        return issues
 
-                return pd.DataFrame(schedule)
-            else:
-                logger.warning("⚠️ MILP 최적화 실패, ERD 스케줄 반환")
-                return self.erd_scheduling(jobs_df)
+    def _calculate_schedule_metrics(self, jobs: List[Job]) -> Tuple[float, float, float, float]:
+        """스케줄 메트릭 계산"""
+        if not jobs:
+            return 0.0, 0.0, 0.0, 0.0
 
-        except Exception as e:
-            logger.error(f"❌ MILP 최적화 오류: {e}")
-            return self.erd_scheduling(jobs_df)
+        # 총 비용 계산
+        total_cost = sum(job.cost for job in jobs)
 
-    def _heuristic_optimization(self, jobs_df: pd.DataFrame) -> pd.DataFrame:
-        """휴리스틱 최적화 (그리디 + 로컬 서치)"""
-        logger.info("🔧 휴리스틱 최적화 적용 중...")
+        # 피크 전력 계산
+        power_timeline = {}
+        for job in jobs:
+            if job.actual_start and job.actual_finish:
+                start_hour = job.actual_start.hour
+                end_hour = job.actual_finish.hour
 
-        # 우선순위 기반 정렬 (전력효율 고려)
-        jobs_df = jobs_df.copy()
-        jobs_df['power_efficiency'] = jobs_df['processing_time'] / jobs_df['power_consumption']
-        sorted_jobs = jobs_df.sort_values(['arrival_time', 'power_efficiency'], ascending=[True, False])
+                for hour in range(start_hour, end_hour + 1):
+                    if hour not in power_timeline:
+                        power_timeline[hour] = 0
+                    power_timeline[hour] += job.power_requirement
 
-        schedule = []
-        current_time = 0
+        peak_power = max(power_timeline.values()) if power_timeline else 0.0
 
-        for _, job in sorted_jobs.iterrows():
-            # 최적 시작 시간 탐색
-            best_start_time = self._find_optimal_start_time(
-                job, current_time, schedule
+        # 총 지연 시간 계산
+        total_delay = 0.0
+        for job in jobs:
+            if job.actual_finish and job.actual_finish > job.due_date:
+                delay = (job.actual_finish - job.due_date).total_seconds() / 3600
+                total_delay += delay
+
+        # 완료 시간 (makespan) 계산
+        if jobs and any(job.actual_finish for job in jobs):
+            latest_finish = max(job.actual_finish for job in jobs if job.actual_finish)
+            earliest_start = min(job.actual_start for job in jobs if job.actual_start)
+            makespan = (latest_finish - earliest_start).total_seconds() / 3600
+        else:
+            makespan = 0.0
+
+        return total_cost, peak_power, total_delay, makespan
+
+
+class GreedyScheduler(BaseScheduler):
+    """그리디 스케줄러 (빠른 근사해)"""
+
+    def __init__(self):
+        super().__init__("greedy_scheduler")
+
+    @log_performance
+    def schedule(self, jobs: List[Job], objective: SchedulingObjective) -> ScheduleResult:
+        """그리디 스케줄링"""
+        start_time = datetime.now()
+
+        # 입력 검증
+        validation_issues = self._validate_jobs(jobs)
+        if validation_issues:
+            raise SchedulingError(f"작업 검증 실패: {validation_issues}")
+
+        # 작업 복사 및 정렬
+        scheduled_jobs = [job for job in jobs]
+
+        # 목적에 따른 정렬
+        if objective == SchedulingObjective.MINIMIZE_COST:
+            scheduled_jobs.sort(key=self._cost_priority_key)
+        elif objective == SchedulingObjective.MINIMIZE_PEAK:
+            scheduled_jobs.sort(key=lambda j: j.power_requirement)
+        elif objective == SchedulingObjective.MINIMIZE_MAKESPAN:
+            scheduled_jobs.sort(key=lambda j: (j.priority, j.due_date))
+        else:
+            scheduled_jobs.sort(key=lambda j: (j.priority, j.due_date))
+
+        # 기계별 스케줄 추적
+        machine_schedules = {}
+        constraints_violated = []
+
+        # 순차적 배치
+        for job in scheduled_jobs:
+            machine_id = job.machine_id
+
+            if machine_id not in machine_schedules:
+                machine_schedules[machine_id] = []
+
+            # 가장 빠른 가능한 시작 시간 찾기
+            earliest_possible = self._find_earliest_slot(
+                job, machine_schedules[machine_id]
             )
 
-            end_time = best_start_time + job['processing_time']
+            # 제약 조건 확인
+            if not self._check_constraints(job, earliest_possible, constraints_violated):
+                # 제약 위반시 다음 가능한 시간으로 이동
+                earliest_possible = self._find_next_feasible_time(job, earliest_possible)
 
-            schedule.append({
-                'job_id': job['job_id'],
-                'start_time': best_start_time,
-                'end_time': end_time,
-                'power_consumption': job['power_consumption'],
-                'processing_time': job['processing_time']
-            })
-
-            current_time = max(current_time, end_time)
-
-        return pd.DataFrame(schedule)
-
-    def _find_optimal_start_time(self, job: pd.Series, earliest_time: int, existing_schedule: List[Dict]) -> int:
-        """작업의 최적 시작 시간 탐색"""
-        earliest_start = max(earliest_time, job['arrival_time'])
-        best_start = earliest_start
-        best_cost = float('inf')
-
-        # 가능한 시작 시간대 탐색 (1시간 간격)
-        for start_candidate in range(earliest_start, job['deadline'] - job['processing_time'], 60):
-
-            # 다른 작업과 충돌 검사
-            if self._check_time_conflict(start_candidate, job['processing_time'], existing_schedule):
-                continue
-
-            # 전력 제약 검사
-            if self._check_power_constraint(start_candidate, job, existing_schedule):
-                continue
+            # 작업 배치
+            job.actual_start = earliest_possible
+            job.actual_finish = earliest_possible + timedelta(minutes=job.processing_time)
+            job.status = JobStatus.SCHEDULED
 
             # 비용 계산
-            cost = self._calculate_job_cost(start_candidate, job)
+            job.cost = self._calculate_job_cost(job)
 
-            if cost < best_cost:
-                best_cost = cost
-                best_start = start_candidate
+            machine_schedules[machine_id].append(job)
 
-        return best_start
+        # 메트릭 계산
+        total_cost, peak_power, total_delay, makespan = self._calculate_schedule_metrics(scheduled_jobs)
 
-    def _check_time_conflict(self, start_time: int, duration: int, schedule: List[Dict]) -> bool:
-        """시간 충돌 검사"""
-        end_time = start_time + duration
+        # 가동률 계산
+        total_processing_time = sum(job.processing_time for job in scheduled_jobs) / 60  # hours
+        utilization_rate = total_processing_time / (makespan * len(machine_schedules)) if makespan > 0 else 0
 
-        for existing in schedule:
-            if not (end_time <= existing['start_time'] or
-                   start_time >= existing['end_time']):
-                return True
-        return False
+        # 목적 함수 값 계산
+        objective_value = self._calculate_objective_value(
+            objective, total_cost, peak_power, makespan, total_delay
+        )
 
-    def _check_power_constraint(self, start_time: int, job: pd.Series, schedule: List[Dict]) -> bool:
-        """피크 전력 제약 검사"""
-        end_time = start_time + job['processing_time']
+        computation_time = (datetime.now() - start_time).total_seconds()
 
-        # 시간대별 전력 사용량 계산
-        for t in range(start_time, end_time):
-            total_power = job['power_consumption']
+        # 통계 업데이트
+        self._update_stats(computation_time, len(constraints_violated) == 0)
 
-            for existing in schedule:
-                if existing['start_time'] <= t < existing['end_time']:
-                    total_power += existing['power_consumption']
+        return ScheduleResult(
+            scheduled_jobs=scheduled_jobs,
+            total_cost=total_cost,
+            peak_power=peak_power,
+            makespan=makespan,
+            total_delay=total_delay,
+            utilization_rate=utilization_rate,
+            objective_value=objective_value,
+            computation_time=computation_time,
+            is_feasible=len(constraints_violated) == 0,
+            constraints_violated=constraints_violated,
+            optimization_details={
+                'algorithm': 'greedy',
+                'sorting_criterion': objective.value,
+                'total_machines': len(machine_schedules)
+            }
+        )
 
-            if total_power > self.peak_power_limit:
-                return True
+    def _cost_priority_key(self, job: Job) -> Tuple:
+        """비용 우선순위 키"""
+        # TOU 요금대를 고려한 비용 추정
+        avg_rate = self.tou_model.get_average_rate(job.earliest_start, job.processing_time)
+        estimated_cost = job.power_requirement * (job.processing_time / 60) * avg_rate
 
-        return False
+        return (job.priority, estimated_cost, job.due_date)
 
-    def _calculate_job_cost(self, start_time: int, job: pd.Series, month: int = 7) -> float:
-        """작업의 전력 비용 계산 (실제 요금표 기반)"""
-        total_cost = 0
-        duration = job['processing_time']
-        power = job['power_consumption']
+    def _find_earliest_slot(self, job: Job, machine_schedule: List[Job]) -> datetime:
+        """기계에서 가장 빠른 가능한 시작 시간 찾기"""
+        earliest = max(job.earliest_start, datetime.now())
 
-        for minute in range(duration):
-            time_point = start_time + minute
-            hour = (time_point // 60) % 24
-            price_info = self.tou_model.get_hourly_price(hour, month)
-            # 분당 비용 = kW × 원/kWh × (1시간/60분)
-            minute_cost = power * price_info['total_price'] / 60
-            total_cost += minute_cost
+        if not machine_schedule:
+            return earliest
 
-        return total_cost
+        # 기존 작업들과 겹치지 않는 시간 찾기
+        machine_schedule.sort(key=lambda j: j.actual_start)
 
-    def _calculate_hourly_power(self, schedule: pd.DataFrame) -> List[float]:
-        """시간대별 전력 사용량 계산"""
-        hourly_power = [0] * 24
+        for scheduled_job in machine_schedule:
+            if scheduled_job.actual_finish <= earliest:
+                continue
 
-        for _, job in schedule.iterrows():
-            start_hour = int(job['start_time'] // 60)
-            end_hour = int(job['end_time'] // 60)
+            if scheduled_job.actual_start <= earliest < scheduled_job.actual_finish:
+                earliest = scheduled_job.actual_finish
 
-            for hour in range(start_hour, min(end_hour + 1, 24)):
-                hourly_power[hour] += job['power_consumption']
+        return earliest
 
-        return hourly_power
+    def _check_constraints(self, job: Job, start_time: datetime, violations: List[str]) -> bool:
+        """제약 조건 확인"""
+        # 기본 시간 제약
+        finish_time = start_time + timedelta(minutes=job.processing_time)
 
-    def _redistribute_jobs(self, schedule: pd.DataFrame, violations: List[Dict]) -> pd.DataFrame:
-        """작업 재배치 (피크 제약 위반 해결)"""
-        optimized = schedule.copy()
+        if finish_time > job.latest_finish:
+            violations.append(f"작업 {job.job_id}: 완료 시간 제약 위반")
+            return False
 
-        # 위반 시간대의 작업들을 식별하고 재배치
-        for violation in violations:
-            hour = violation['hour']
-            # 해당 시간대 작업들 중 우선순위가 낮은 것 이동
-            # (실제 구현에서는 더 정교한 로직 필요)
-            pass
+        # 추가 제약 조건들 (constraint_manager 사용)
+        constraint_result = self.constraint_manager.check_constraints(job, start_time)
+        if not constraint_result.is_feasible:
+            violations.extend(constraint_result.violated_constraints)
+            return False
 
-        return optimized
+        return True
 
-    def evaluate_schedule(self, schedule: pd.DataFrame, jobs_df: pd.DataFrame, month: int = 7) -> Dict:
-        """스케줄 평가 (실제 요금표 기반)"""
-        results = {}
+    def _find_next_feasible_time(self, job: Job, current_time: datetime) -> datetime:
+        """다음 실행 가능한 시간 찾기"""
+        # 간단한 구현: 1시간씩 이동하며 확인
+        next_time = current_time
+        max_attempts = 24 * 7  # 최대 1주일
 
-        # 1. 총 비용 계산 (실제 요금표 기반)
-        total_energy_cost = 0
+        for _ in range(max_attempts):
+            next_time += timedelta(hours=1)
+
+            if self._check_constraints(job, next_time, []):
+                return next_time
+
+        # 제약을 만족하는 시간을 찾지 못한 경우
+        self.logger.warning(f"작업 {job.job_id}에 대한 실행 가능한 시간을 찾지 못함")
+        return current_time
+
+    def _calculate_job_cost(self, job: Job) -> float:
+        """작업 비용 계산"""
+        if not job.actual_start:
+            return 0.0
+
+        duration_hours = job.processing_time / 60
+        return self.tou_model.calculate_cost(
+            job.actual_start, duration_hours, job.power_requirement
+        )
+
+    def _calculate_objective_value(self,
+                                   objective: SchedulingObjective,
+                                   cost: float,
+                                   peak: float,
+                                   makespan: float,
+                                   delay: float) -> float:
+        """목적 함수 값 계산"""
+        if objective == SchedulingObjective.MINIMIZE_COST:
+            return cost
+        elif objective == SchedulingObjective.MINIMIZE_PEAK:
+            return peak
+        elif objective == SchedulingObjective.MINIMIZE_MAKESPAN:
+            return makespan
+        elif objective == SchedulingObjective.MULTI_OBJECTIVE:
+            # 가중 합 (정규화 필요)
+            normalized_cost = cost / 10000  # 임시 정규화
+            normalized_peak = peak / 1000
+            normalized_makespan = makespan / 100
+            normalized_delay = delay / 10
+
+            return (0.4 * normalized_cost +
+                    0.3 * normalized_peak +
+                    0.2 * normalized_makespan +
+                    0.1 * normalized_delay)
+        else:
+            return cost + peak + makespan + delay
+
+    def _update_stats(self, computation_time: float, is_successful: bool):
+        """통계 업데이트"""
+        self.stats['total_scheduling'] += 1
+
+        if is_successful:
+            self.stats['successful_scheduling'] += 1
+
+        # 평균 계산 시간 업데이트
+        total = self.stats['total_scheduling']
+        self.stats['average_computation_time'] = (
+                (self.stats['average_computation_time'] * (total - 1) + computation_time) / total
+        )
+
+
+class OptimalScheduler(BaseScheduler):
+    """최적 스케줄러 (MIP 기반)"""
+
+    def __init__(self):
+        super().__init__("optimal_scheduler")
+        self.time_limit = 300  # 5분
+
+    @log_performance
+    def schedule(self, jobs: List[Job], objective: SchedulingObjective) -> ScheduleResult:
+        """최적 스케줄링 (MIP)"""
+        start_time = datetime.now()
+
+        # 입력 검증
+        validation_issues = self._validate_jobs(jobs)
+        if validation_issues:
+            raise SchedulingError(f"작업 검증 실패: {validation_issues}")
+
+        try:
+            # OR-Tools 솔버 생성
+            solver = pywraplp.Solver.CreateSolver('SCIP')
+            if not solver:
+                raise OptimizationException("MIP 솔버를 생성할 수 없음")
+
+            # 변수 및 제약 조건 생성
+            variables, constraints = self._create_mip_model(solver, jobs, objective)
+
+            # 목적 함수 설정
+            self._set_objective(solver, variables, jobs, objective)
+
+            # 솔버 실행
+            solver.SetTimeLimit(self.time_limit * 1000)  # milliseconds
+            status = solver.Solve()
+
+            # 결과 해석
+            if status == pywraplp.Solver.OPTIMAL or status == pywraplp.Solver.FEASIBLE:
+                scheduled_jobs = self._extract_solution(solver, variables, jobs)
+                is_feasible = True
+                constraints_violated = []
+            else:
+                # 해를 찾지 못한 경우 그리디로 폴백
+                self.logger.warning("최적해를 찾지 못함. 그리디 알고리즘으로 폴백")
+                greedy_scheduler = GreedyScheduler()
+                return greedy_scheduler.schedule(jobs, objective)
+
+        except Exception as e:
+            self.logger.error(f"MIP 스케줄링 오류: {e}")
+            # 오류 발생시 그리디로 폴백
+            greedy_scheduler = GreedyScheduler()
+            return greedy_scheduler.schedule(jobs, objective)
+
+        # 메트릭 계산
+        total_cost, peak_power, total_delay, makespan = self._calculate_schedule_metrics(scheduled_jobs)
+
+        # 가동률 계산
+        machine_count = len(set(job.machine_id for job in jobs))
+        total_processing_time = sum(job.processing_time for job in scheduled_jobs) / 60
+        utilization_rate = total_processing_time / (makespan * machine_count) if makespan > 0 else 0
+
+        # 목적 함수 값
+        objective_value = solver.Objective().Value() if solver else 0
+
+        computation_time = (datetime.now() - start_time).total_seconds()
+        self._update_stats(computation_time, is_feasible)
+
+        return ScheduleResult(
+            scheduled_jobs=scheduled_jobs,
+            total_cost=total_cost,
+            peak_power=peak_power,
+            makespan=makespan,
+            total_delay=total_delay,
+            utilization_rate=utilization_rate,
+            objective_value=objective_value,
+            computation_time=computation_time,
+            is_feasible=is_feasible,
+            constraints_violated=constraints_violated,
+            optimization_details={
+                'algorithm': 'mip_optimal',
+                'solver_status': status,
+                'time_limit': self.time_limit,
+                'gap': solver.Objective().BestBound() - solver.Objective().Value() if solver else 0
+            }
+        )
+
+    def _create_mip_model(self, solver, jobs: List[Job], objective: SchedulingObjective):
+        """MIP 모델 생성"""
+        # 시간 이산화 (시간 단위)
+        time_horizon = 24 * 7  # 1주일
+        time_slots = list(range(time_horizon))
+
+        variables = {}
+        constraints = []
+
+        # 결정 변수: x[j,t] = 작업 j가 시간 t에 시작하면 1
+        for job in jobs:
+            for t in time_slots:
+                var_name = f"x_{job.job_id}_{t}"
+                variables[var_name] = solver.IntVar(0, 1, var_name)
+
+        # 제약 조건 1: 각 작업은 정확히 한 번 시작
+        for job in jobs:
+            constraint = solver.Constraint(1, 1)
+            for t in time_slots:
+                var_name = f"x_{job.job_id}_{t}"
+                constraint.SetCoefficient(variables[var_name], 1)
+            constraints.append(constraint)
+
+        # 제약 조건 2: 기계 용량 제약
+        machines = set(job.machine_id for job in jobs)
+        for machine in machines:
+            machine_jobs = [job for job in jobs if job.machine_id == machine]
+
+            for t in time_slots:
+                constraint = solver.Constraint(0, 1)
+                for job in machine_jobs:
+                    # 작업이 t 시간에 실행 중인지 확인
+                    for start_t in range(max(0, t - job.processing_time // 60 + 1), t + 1):
+                        if start_t in time_slots:
+                            var_name = f"x_{job.job_id}_{start_t}"
+                            constraint.SetCoefficient(variables[var_name], 1)
+                constraints.append(constraint)
+
+        return variables, constraints
+
+    def _set_objective(self, solver, variables, jobs: List[Job], objective: SchedulingObjective):
+        """목적 함수 설정"""
+        objective_expr = solver.Objective()
+
+        time_horizon = 24 * 7
+        time_slots = list(range(time_horizon))
+
+        if objective == SchedulingObjective.MINIMIZE_COST:
+            # 비용 최소화
+            for job in jobs:
+                for t in time_slots:
+                    var_name = f"x_{job.job_id}_{t}"
+                    # 간단한 비용 모델 (실제로는 TOU 요금을 고려해야 함)
+                    cost_coeff = job.power_requirement * (job.processing_time / 60) * (1.0 + 0.1 * (t % 24))
+                    objective_expr.SetCoefficient(variables[var_name], cost_coeff)
+
+        elif objective == SchedulingObjective.MINIMIZE_MAKESPAN:
+            # 완료시간 최소화 (보조 변수 필요)
+            makespan_var = solver.IntVar(0, time_horizon, "makespan")
+
+            for job in jobs:
+                for t in time_slots:
+                    var_name = f"x_{job.job_id}_{t}"
+                    completion_time = t + job.processing_time // 60
+
+                    # makespan >= completion_time * x[j,t]
+                    constraint = solver.Constraint(-solver.infinity(), 0)
+                    constraint.SetCoefficient(makespan_var, 1)
+                    constraint.SetCoefficient(variables[var_name], -completion_time)
+
+            objective_expr.SetCoefficient(makespan_var, 1)
+
+        objective_expr.SetMinimization()
+
+    def _extract_solution(self, solver, variables, jobs: List[Job]) -> List[Job]:
+        """해 추출"""
+        scheduled_jobs = []
+        time_horizon = 24 * 7
+
+        for job in jobs:
+            job_copy = Job(
+                job_id=job.job_id,
+                machine_id=job.machine_id,
+                power_requirement=job.power_requirement,
+                processing_time=job.processing_time,
+                due_date=job.due_date,
+                priority=job.priority,
+                earliest_start=job.earliest_start,
+                latest_finish=job.latest_finish,
+                setup_time=job.setup_time,
+                status=JobStatus.SCHEDULED
+            )
+
+            # 시작 시간 찾기
+            for t in range(time_horizon):
+                var_name = f"x_{job.job_id}_{t}"
+                if variables[var_name].solution_value() > 0.5:
+                    job_copy.actual_start = datetime.now() + timedelta(hours=t)
+                    job_copy.actual_finish = job_copy.actual_start + timedelta(minutes=job.processing_time)
+                    job_copy.cost = self._calculate_job_cost(job_copy)
+                    break
+
+            scheduled_jobs.append(job_copy)
+
+        return scheduled_jobs
+
+
+class AdaptiveScheduler(BaseScheduler):
+    """적응형 스케줄러 (실시간 재스케줄링)"""
+
+    def __init__(self):
+        super().__init__("adaptive_scheduler")
+        self.current_schedule: Optional[ScheduleResult] = None
+        self.rescheduling_threshold = 0.2  # 20% 변화시 재스케줄링
+        self.base_scheduler = GreedyScheduler()  # 기본 스케줄러
+
+    def schedule(self, jobs: List[Job], objective: SchedulingObjective) -> ScheduleResult:
+        """적응형 스케줄링"""
+        # 초기 스케줄링 또는 전체 재스케줄링
+        result = self.base_scheduler.schedule(jobs, objective)
+        self.current_schedule = result
+        return result
+
+    def update_schedule(self,
+                        new_jobs: List[Job] = None,
+                        completed_jobs: List[str] = None,
+                        delayed_jobs: List[str] = None) -> Optional[ScheduleResult]:
+        """스케줄 업데이트"""
+        if not self.current_schedule:
+            return None
+
+        # 변화량 계산
+        change_ratio = self._calculate_change_ratio(new_jobs, completed_jobs, delayed_jobs)
+
+        if change_ratio > self.rescheduling_threshold:
+            self.logger.info(f"변화량 {change_ratio:.2%} > 임계값 {self.rescheduling_threshold:.2%}, 재스케줄링 수행")
+
+            # 업데이트된 작업 리스트 생성
+            updated_jobs = self._update_job_list(new_jobs, completed_jobs, delayed_jobs)
+
+            # 재스케줄링
+            new_schedule = self.base_scheduler.schedule(
+                updated_jobs,
+                SchedulingObjective.MINIMIZE_COST  # 기본 목적
+            )
+
+            self.current_schedule = new_schedule
+            return new_schedule
+
+        return None
+
+    def _calculate_change_ratio(self,
+                                new_jobs: List[Job],
+                                completed_jobs: List[str],
+                                delayed_jobs: List[str]) -> float:
+        """변화율 계산"""
+        if not self.current_schedule:
+            return 1.0
+
+        total_jobs = len(self.current_schedule.scheduled_jobs)
+
+        changes = 0
+        changes += len(new_jobs) if new_jobs else 0
+        changes += len(completed_jobs) if completed_jobs else 0
+        changes += len(delayed_jobs) if delayed_jobs else 0
+
+        return changes / max(total_jobs, 1)
+
+    def _update_job_list(self,
+                         new_jobs: List[Job],
+                         completed_jobs: List[str],
+                         delayed_jobs: List[str]) -> List[Job]:
+        """작업 리스트 업데이트"""
+        current_jobs = self.current_schedule.scheduled_jobs.copy()
+
+        # 완료된 작업 제거
+        if completed_jobs:
+            current_jobs = [job for job in current_jobs
+                            if job.job_id not in completed_jobs]
+
+        # 지연된 작업 상태 업데이트
+        if delayed_jobs:
+            for job in current_jobs:
+                if job.job_id in delayed_jobs:
+                    job.status = JobStatus.DELAYED
+                    # 새로운 시작 시간 설정 (현재 시간 이후)
+                    job.earliest_start = max(job.earliest_start, datetime.now())
+
+        # 새 작업 추가
+        if new_jobs:
+            current_jobs.extend(new_jobs)
+
+        return current_jobs
+
+
+# 팩토리 함수들
+def create_scheduler(scheduler_type: str = "greedy") -> BaseScheduler:
+    """스케줄러 생성"""
+    if scheduler_type == "greedy":
+        return GreedyScheduler()
+    elif scheduler_type == "optimal":
+        return OptimalScheduler()
+    elif scheduler_type == "adaptive":
+        return AdaptiveScheduler()
+    else:
+        raise ValueError(f"지원하지 않는 스케줄러 타입: {scheduler_type}")
+
+
+def schedule_jobs(jobs: List[Job],
+                  objective: SchedulingObjective = SchedulingObjective.MINIMIZE_COST,
+                  scheduler_type: str = "greedy") -> ScheduleResult:
+    """편의 함수: 작업 스케줄링"""
+    scheduler = create_scheduler(scheduler_type)
+    return scheduler.schedule(jobs, objective)
+
+
+# 사용 예시
+if __name__ == "__main__":
+    # 샘플 작업 생성
+    sample_jobs = [
+        Job(
+            job_id="job_1",
+            machine_id="machine_1",
+            power_requirement=50.0,
+            processing_time=120,  # 2시간
+            due_date=datetime.now() + timedelta(hours=8),
+            priority=1
+        ),
+        Job(
+            job_id="job_2",
+            machine_id="machine_1",
+            power_requirement=75.0,
+            processing_time=180,  # 3시간
+            due_date=datetime.now() + timedelta(hours=12),
+            priority=2
+        ),
+        Job(
+            job_id="job_3",
+            machine_id="machine_2",
+            power_requirement=60.0,
+            processing_time=90,  # 1.5시간
+            due_date=datetime.now() + timedelta(hours=6),
+            priority=1
+        )
+    ]
+
+    # 스케줄링 수행
+    result = schedule_jobs(
+        sample_jobs,
+        SchedulingObjective.MINIMIZE_COST,
+        "greedy"
+    )
+
+    print("=== 스케줄링 결과 ===")
+    print(f"실행 가능: {result.is_feasible}")
+    print(f"총 비용: {result.total_cost:.2f}")
+    print(f"피크 전력: {result.peak_power:.2f} kW")
+    print(f"완료 시간: {result.makespan:.2f} 시간")
+    print(f"지연 시간: {result.total_delay:.2f} 시간")
+    print(f"계산 시간: {result.computation_time:.3f} 초")
+
+    # 간트 차트 데이터
+    gantt_data = result.to_gantt_data()
+    print("\n=== 간트 차트 데이터 ===")
+    for item in gantt_data:
+        print(f"작업 {item['job_id']}: {item['start']} ~ {item['finish']} ({item['power']} kW)")
+        """
+스마트팩토리 에너지 관리 시스템 - 스케줄링 최적화 모듈
+
+전력 기반 생산 스케줄링 최적화
+- TOU 요금제 기반 비용 최소화
+- 피크 전력 제약 조건 준수
+- 다중 목적 최적화 (비용, 효율, 납기)
+- 실시간 스케줄 조정 및 재최적화
+"""
+
+import numpy as np
+import pandas as pd
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Union, Any
+from dataclasses import dataclass, field
+from enum import Enum
+import json
+from concurrent.futures import ThreadPoolExecutor
+import asyncio
+
+# 최적화 라이브러리
+from scipy.optimize import minimize, linprog
+from ortools.linear_solver import pywraplp
+from ortools.sat.python import cp_model
+
+# Core 모듈
+from core.config import get_config
+from core.logger import get_logger, log_performance
+from core.exceptions import (
+    SchedulingError, ConstraintViolationError,
+    PeakPowerExceededError, OptimizationException,
+    safe_execute
+)
+
+# Optimization 모듈
+from .tou_pricing import TOUPricingModel
+from .constraints import ConstraintManager, PowerConstraint, TimeConstraint
+
+
+class SchedulingObjective(Enum):
+    """스케줄링 목적"""
+    MINIMIZE_COST = "minimize_cost"
+    MINIMIZE_PEAK = "minimize_peak"
+    MINIMIZE_MAKESPAN = "minimize_makespan"
+    MAXIMIZE_EFFICIENCY = "maximize_efficiency"
+    MULTI_OBJECTIVE = "multi_objective"
+
+
+class JobStatus(Enum):
+    """작업 상태"""
+    PENDING = "pending"
+    SCHEDULED = "scheduled"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    DELAYED = "delayed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Job:
+    """생산 작업"""
+    job_id: str
+    machine_id: str
+    power_requirement: float  # kW
+    processing_time: int  # minutes
+    due_date: datetime
+    priority: int = 1  # 1=highest, 5=lowest
+    earliest_start: Optional[datetime] = None
+    latest_finish: Optional[datetime] = None
+    setup_time: int = 0  # minutes
+    status: JobStatus = JobStatus.PENDING
+    actual_start: Optional[datetime] = None
+    actual_finish: Optional[datetime] = None
+    cost: float = 0.0
+
+    def __post_init__(self):
+        if self.earliest_start is None:
+            self.earliest_start = datetime.now()
+        if self.latest_finish is None:
+            self.latest_finish = self.due_date
+
+    def to_dict(self) -> Dict:
+        """딕셔너리 변환"""
+        return {
+            'job_id': self.job_id,
+            'machine_id': self.machine_id,
+            'power_requirement': self.power_requirement,
+            'processing_time': self.processing_time,
+            'due_date': self.due_date.isoformat(),
+            'priority': self.priority,
+            'earliest_start': self.earliest_start.isoformat() if self.earliest_start else None,
+            'latest_finish': self.latest_finish.isoformat() if self.latest_finish else None,
+            'setup_time': self.setup_time,
+            'status': self.status.value,
+            'actual_start': self.actual_start.isoformat() if self.actual_start else None,
+            'actual_finish': self.actual_finish.isoformat() if self.actual_finish else None,
+            'cost': self.cost
+        }
+
+
+@dataclass
+class ScheduleResult:
+    """스케줄링 결과"""
+    scheduled_jobs: List[Job]
+    total_cost: float
+    peak_power: float
+    makespan: float  # hours
+    total_delay: float  # hours
+    utilization_rate: float
+    objective_value: float
+    computation_time: float
+    is_feasible: bool
+    constraints_violated: List[str] = field(default_factory=list)
+    optimization_details: Dict = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=datetime.now)
+
+    def get_summary(self) -> Dict:
+        """결과 요약"""
+        return {
+            'total_jobs': len(self.scheduled_jobs),
+            'feasible': self.is_feasible,
+            'total_cost': round(self.total_cost)

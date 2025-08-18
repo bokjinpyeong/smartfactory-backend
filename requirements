@@ -1,0 +1,83 @@
+# 스마트팩토리 에너지 관리 시스템 - 의존성 패키지
+
+# Core Dependencies
+python>=3.8
+
+# Web Framework & API
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+websockets>=11.0
+
+# Data Processing & Analysis
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-learn>=1.3.0
+
+# Machine Learning & AI
+torch>=2.0.0
+xgboost>=1.7.0
+joblib>=1.3.0
+
+# Time Series & Forecasting
+statsmodels>=0.14.0
+
+# Optimization
+ortools>=9.5.0
+
+# Database & Storage
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0  # PostgreSQL
+pymongo>=4.3.0          # MongoDB
+
+# IoT & Communication
+paho-mqtt>=1.6.0
+
+# Configuration & Environment
+pyyaml>=6.0
+python-dotenv>=1.0.0
+
+# Logging & Monitoring
+structlog>=23.1.0
+
+# Security & Authentication
+pyjwt>=2.8.0
+passlib[bcrypt]>=1.7.0
+python-multipart>=0.0.6
+
+# Validation
+pydantic>=2.0.0
+
+# Utilities
+python-dateutil>=2.8.0
+requests>=2.31.0
+aiofiles>=23.0.0
+
+# Development & Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+black>=23.0.0
+flake8>=6.0.0
+mypy>=1.5.0
+
+# Documentation
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.3.0
+
+# Optional: 시각화 (대시보드용)
+plotly>=5.15.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Optional: 고급 ML 기능
+lightgbm>=4.0.0
+catboost>=1.2.0
+tensorflow>=2.13.0      # 선택적 설치
+
+# Optional: 분산 처리
+celery>=5.3.0
+redis>=4.6.0
+
+# Optional: 모니터링
+prometheus-client>=0.17.0

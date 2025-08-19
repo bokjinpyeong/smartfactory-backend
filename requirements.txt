@@ -1,0 +1,2 @@
+numpy==1.26.4
+# 필요시 pandas, pulp 등 추가

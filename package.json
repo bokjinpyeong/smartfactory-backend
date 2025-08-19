@@ -1,14 +1,14 @@
 {
-  "name": "smartfactory-backend",
-  "version": "0.0.0",
-  "private": true,
-  "scripts": {
-    "start": "node ./bin/www"
-  },
   "dependencies": {
-    "cookie-parser": "~1.4.4",
-    "debug": "~2.6.9",
-    "express": "~4.16.1",
-    "morgan": "~1.9.1"
+    "@aws-sdk/client-eventbridge": "^3.864.0",
+    "@aws-sdk/client-lambda": "^3.865.0",
+    "@aws-sdk/client-ses": "^3.624.0",
+    "bcrypt": "^6.0.0",
+    "compression": "^1.8.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.1",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "mysql2": "^3.14.2"
   }
 }
